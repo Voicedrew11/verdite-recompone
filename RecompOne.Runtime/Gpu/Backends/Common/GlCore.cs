@@ -6,70 +6,79 @@ namespace RecompOne.Runtime.Hle;
 public sealed class GlCore : IGpuBackend
 {
     [StructLayout(LayoutKind.Sequential)]
-    private struct GlVertex
-    {
-        public float X, Y;
-        public float R, G, B;
-        public float Clut, Texpage;
-        public float U, V;
-        public float W;
-    }
+    // W is the clip W the vertex shader divides by: the view depth GteDepth
+    // recovered, or exactly 1 for everything that had none, which is every vertex
+    // this renderer ever saw before.
+    struct GlVertex { public float X, Y; public float R, G, B; public float Clut, Texpage; public float U, V; public float W, Z; }
 
-    private const int MaxVerts = 0x40000;
+    const int MaxVerts = 0x40000;
 
-    private readonly GL _gl;
-    private readonly IGlVram _vram;
-    private readonly List<uint> _images = [];
-    private readonly GlDisplayRt?[] _rts = new GlDisplayRt?[2];
-    private long _rtStamp;
-    private long _frame;
-    
+    readonly GL _gl;
+    readonly IGlVram _vram;
+    readonly List<uint> _images = [];
+    readonly GlDisplayRt?[] _rts = new GlDisplayRt?[2];
+    long _rtStamp;
+    long _frame;
+
+    /// <summary>
+    /// Upstream advances the frame counter from HostWindow, once per host frame.
+    /// This backend cannot: 0016 requires the advance to sit immediately after
+    /// the trailing Flush in PresentDisplay, because the depth clear keys on
+    /// LastDrawFrame != _frame and bumping it anywhere else makes the tail of the
+    /// outgoing frame look like the head of the next one -- which is the bug that
+    /// left every frame inheriting the last batch's depths. So this is a no-op and
+    /// the counter is advanced where it must be.
+    /// </summary>
     public void AdvanceFrame()
     {
-        _frame++;
     }
 
+    uint _vao, _vbo, _presentVao, _presentVbo, _progPrim, _progPresent, _progPresent24;
+    uint _presentFbo, _presentTex;
+    int _presentW, _presentH;
+    bool _presentNearest;
 
-    private uint _vao, _vbo, _presentVao, _presentVbo, _progPrim, _progPresent, _progPresent24;
-    private uint _presentFbo, _presentTex;
-    private int _presentW, _presentH;
-    private bool _presentNearest;
+    uint _postProg, _postFbo, _postTex;
+    int _postW, _postH, _postVersion = -1;
+    int _uPostTexSize, _uPostOutputSize, _uPostTime, _uPostFrame;
+    int _postFrame, _postParamVersion = -1;
+    (string Name, float Value)[] _postParams = [];
+    int[] _postParamLoc = [];
+    readonly System.Diagnostics.Stopwatch _postClock = System.Diagnostics.Stopwatch.StartNew();
 
-    private uint _postProg, _postFbo, _postTex;
-    private int _postW, _postH, _postVersion = -1;
-    private int _uPostTexSize, _uPostOutputSize, _uPostTime, _uPostFrame;
-    private int _postFrame, _postParamVersion = -1;
-    private (string Name, float Value)[] _postParams = [];
-    private int[] _postParamLoc = [];
-    private readonly System.Diagnostics.Stopwatch _postClock = System.Diagnostics.Stopwatch.StartNew();
+    readonly GlVertex[] _verts = new GlVertex[MaxVerts];
+    int _count;
+    float _drawMinX, _drawMinY, _drawMaxX, _drawMaxY;
 
-    private readonly GlVertex[] _verts = new GlVertex[MaxVerts];
-    private int _count;
-    private float _drawMinX, _drawMinY, _drawMaxX, _drawMaxY;
+    HleDrawEnv _env;
 
-    private HleDrawEnv _env;
-
-    private GlDisplayRt? _kTarget;
-    private bool _kSamplesVram;
-    private int _kTexX0, _kTexY0, _kTexX1, _kTexY1;
-    private bool _vramDirty;
-    private int _vdX0, _vdY0, _vdX1, _vdY1;
-    private bool _kTransparent;
-    private int _kImage = -1;
-    private int _kBlend, _kSetMask, _kCheckMask;
-    private int _kTwAndX, _kTwAndY, _kTwOrX, _kTwOrY;
-    private int _kClipX0, _kClipY0, _kClipX1, _kClipY1;
-    private uint _kRepTex, _kRepClut;
-    private float _kRepX, _kRepY, _kRepW, _kRepH;
-    private int _kRepClutCount;
-    private int _uTexWindow, _uBlend, _uBlendOpaque, _uSetMask, _uCheckMask, _uPosBias, _uFbInv;
-    private int _uRepRect, _uRepClutCount;
-    private int _uPresentOrigin, _uPresentSize, _uPresentTexSize, _uPresent24Origin, _uPresent24Size;
+    GlDisplayRt? _kTarget;
+    bool _kTransparent;
+    int _kImage = -1;
+    int _kBlend, _kSetMask, _kCheckMask;
+    int _kZMode;
+    // The last render target a depth-testing batch was drawn to, for the diagnostic
+    // readback: it is the only unambiguous answer to "which depth buffer is this
+    // frame's". Diagnostic only — nothing else reads it.
+    GlDisplayRt? _lastZRt;
+    int _kTwAndX, _kTwAndY, _kTwOrX, _kTwOrY;
+    int _kClipX0, _kClipY0, _kClipX1, _kClipY1;
+    uint _kRepTex, _kRepClut;
+    float _kRepX, _kRepY, _kRepW, _kRepH;
+    int _kRepClutCount;
+    int _uTexWindow, _uBlend, _uBlendOpaque, _uSetMask, _uCheckMask, _uPosBias, _uFbInv;
+    int _uTrueColor;
+    // The true-color flag the live display targets were built with. When it drifts
+    // from GteDepth.TrueColor the targets carry the wrong pixel format, so they are
+    // torn down at the next present and rebuilt (their content survives in VRAM).
+    bool _rtsTrueColor;
+    int _uRepRect, _uRepClutCount;
+    int _uPresentOrigin, _uPresentSize, _uPresentTexSize, _uPresent24Origin, _uPresent24Size;
 
     public bool Ready { get; private set; }
 
-    private readonly bool _legacy;
-    private int _uVramSize, _uDestSize, _uSemiTrans, _uBlendMode;
+    readonly bool _legacy;
+    int _uVramSize, _uDestSize, _uSemiTrans, _uBlendMode;
 
     public GlCore(GL gl, IGlVram vram, bool legacy = false)
     {
@@ -82,11 +91,11 @@ public sealed class GlCore : IGpuBackend
     {
         _vram.Init();
 
-        var primVs = _legacy ? GlShaders.PrimVs120 : GlShaders.PrimVs;
-        var primFs = _legacy ? GlShaders.PrimFs120 : GlShaders.PrimFs;
-        var fullVs = _legacy ? GlShaders.FullscreenVs120 : GlShaders.FullscreenVs;
-        var presentFs = _legacy ? GlShaders.PresentFs120 : GlShaders.PresentFs;
-        var present24Fs = _legacy ? GlShaders.Present24Fs120 : GlShaders.Present24Fs;
+        string primVs = _legacy ? GlShaders.PrimVs120 : GlShaders.PrimVs;
+        string primFs = _legacy ? GlShaders.PrimFs120 : GlShaders.PrimFs;
+        string fullVs = _legacy ? GlShaders.FullscreenVs120 : GlShaders.FullscreenVs;
+        string presentFs = _legacy ? GlShaders.PresentFs120 : GlShaders.PresentFs;
+        string present24Fs = _legacy ? GlShaders.Present24Fs120 : GlShaders.Present24Fs;
 
         _progPrim = GlShaders.BuildPrim(_gl, primVs, primFs, "prim");
         _progPresent = GlShaders.BuildFullscreen(_gl, fullVs, presentFs, "present");
@@ -105,6 +114,8 @@ public sealed class GlCore : IGpuBackend
         _uCheckMask = _gl.GetUniformLocation(_progPrim, "uCheckMask");
         _uPosBias = _gl.GetUniformLocation(_progPrim, "uPosBias");
         _uFbInv = _gl.GetUniformLocation(_progPrim, "uFbInv");
+        _uTrueColor = _gl.GetUniformLocation(_progPrim, "uTrueColor");
+        _rtsTrueColor = GteDepth.TrueColor;
         _uRepRect = _gl.GetUniformLocation(_progPrim, "uRepRect");
         _uRepClutCount = _gl.GetUniformLocation(_progPrim, "uRepClutCount");
 
@@ -128,28 +139,22 @@ public sealed class GlCore : IGpuBackend
         _gl.UseProgram(_progPresent24);
         _gl.Uniform1(_gl.GetUniformLocation(_progPresent24, "uVram"), 0);
         SetScaleUniform(_progPresent24);
-        var uVramSize24 = _gl.GetUniformLocation(_progPresent24, "uVramSize");
+        int uVramSize24 = _gl.GetUniformLocation(_progPresent24, "uVramSize");
         if (uVramSize24 >= 0) _gl.Uniform2(uVramSize24, (float)GlVram.Width, GlVram.Height);
 
         _vao = _gl.GenVertexArray();
         _vbo = _gl.GenBuffer();
         _gl.BindVertexArray(_vao);
         _gl.BindBuffer(BufferTargetARB.ArrayBuffer, _vbo);
-        _gl.BufferData(BufferTargetARB.ArrayBuffer, (nuint)(MaxVerts * sizeof(GlVertex)), null,
-            BufferUsageARB.DynamicDraw);
-        var stride = (uint)sizeof(GlVertex);
-        _gl.EnableVertexAttribArray(0);
-        _gl.VertexAttribPointer(0, 2, VertexAttribPointerType.Float, false, stride, (void*)0);
-        _gl.EnableVertexAttribArray(1);
-        _gl.VertexAttribPointer(1, 3, VertexAttribPointerType.Float, false, stride, (void*)8);
-        _gl.EnableVertexAttribArray(2);
-        _gl.VertexAttribPointer(2, 1, VertexAttribPointerType.Float, false, stride, (void*)20);
-        _gl.EnableVertexAttribArray(3);
-        _gl.VertexAttribPointer(3, 1, VertexAttribPointerType.Float, false, stride, (void*)24);
-        _gl.EnableVertexAttribArray(4);
-        _gl.VertexAttribPointer(4, 2, VertexAttribPointerType.Float, false, stride, (void*)28);
-        _gl.EnableVertexAttribArray(5);
-        _gl.VertexAttribPointer(5, 1, VertexAttribPointerType.Float, false, stride, (void*)36);
+        _gl.BufferData(BufferTargetARB.ArrayBuffer, (nuint)(MaxVerts * sizeof(GlVertex)), null, BufferUsageARB.DynamicDraw);
+        uint stride = (uint)sizeof(GlVertex);
+        _gl.EnableVertexAttribArray(0); _gl.VertexAttribPointer(0, 2, VertexAttribPointerType.Float, false, stride, (void*)0);
+        _gl.EnableVertexAttribArray(1); _gl.VertexAttribPointer(1, 3, VertexAttribPointerType.Float, false, stride, (void*)8);
+        _gl.EnableVertexAttribArray(2); _gl.VertexAttribPointer(2, 1, VertexAttribPointerType.Float, false, stride, (void*)20);
+        _gl.EnableVertexAttribArray(3); _gl.VertexAttribPointer(3, 1, VertexAttribPointerType.Float, false, stride, (void*)24);
+        _gl.EnableVertexAttribArray(4); _gl.VertexAttribPointer(4, 2, VertexAttribPointerType.Float, false, stride, (void*)28);
+        _gl.EnableVertexAttribArray(5); _gl.VertexAttribPointer(5, 1, VertexAttribPointerType.Float, false, stride, (void*)36);
+        _gl.EnableVertexAttribArray(6); _gl.VertexAttribPointer(6, 1, VertexAttribPointerType.Float, false, stride, (void*)40);
 
         // fullscreen quad for present, real vbo since gl_VertexID without arrays does not draw on mesa for some reason?? or i did it wrong?
         _presentVao = _gl.GenVertexArray();
@@ -158,11 +163,7 @@ public sealed class GlCore : IGpuBackend
         _gl.BindBuffer(BufferTargetARB.ArrayBuffer, _presentVbo);
         float[] quad = { -1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f };
         fixed (float* qp = quad)
-        {
-            _gl.BufferData(BufferTargetARB.ArrayBuffer, (nuint)(quad.Length * sizeof(float)), qp,
-                BufferUsageARB.StaticDraw);
-        }
-
+            _gl.BufferData(BufferTargetARB.ArrayBuffer, (nuint)(quad.Length * sizeof(float)), qp, BufferUsageARB.StaticDraw);
         _gl.EnableVertexAttribArray(0);
         _gl.VertexAttribPointer(0, 2, VertexAttribPointerType.Float, false, 2 * sizeof(float), (void*)0);
         _gl.BindBuffer(BufferTargetARB.ArrayBuffer, 0);
@@ -173,51 +174,19 @@ public sealed class GlCore : IGpuBackend
         _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)GLEnum.Linear);
         _presentFbo = _gl.GenFramebuffer();
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _presentFbo);
-        _gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
-            TextureTarget.Texture2D, _presentTex, 0);
+        _gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0, TextureTarget.Texture2D, _presentTex, 0);
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
 
-        _kClipX1 = 1023;
-        _kClipY1 = 511;
+        _kClipX1 = 1023; _kClipY1 = 511;
         Ready = true;
     }
 
-    public void SetDrawEnv(in HleDrawEnv env)
-    {
-        _env = env;
-    }
+    public void SetDrawEnv(in HleDrawEnv env) => _env = env;
 
-    private const int FbSlackW = 64;
-    private const int FbSlackH = 32;
+    const int FbSlackW = 64;
+    const int FbSlackH = 32;
 
-    private int _clsClipX0 = int.MinValue, _clsClipY0, _clsClipX1, _clsClipY1;
-    private long _clsVersion = -1;
-    private GlDisplayRt? _clsResult;
-
-    private void InvalidateClassify()
-    {
-        _clsClipX0 = int.MinValue;
-    }
-
-    private GlDisplayRt? Classify()
-    {
-        if (_clsClipX0 == _env.ClipX0 && _clsClipY0 == _env.ClipY0 && _clsClipX1 == _env.ClipX1 &&
-            _clsClipY1 == _env.ClipY1 && _clsVersion == GpuHle.RectVersion)
-        {
-            if (_clsResult != null) _clsResult.Stamp = ++_rtStamp;
-            return _clsResult;
-        }
-
-        _clsClipX0 = _env.ClipX0;
-        _clsClipY0 = _env.ClipY0;
-        _clsClipX1 = _env.ClipX1;
-        _clsClipY1 = _env.ClipY1;
-        _clsVersion = GpuHle.RectVersion;
-        _clsResult = ClassifySlow();
-        return _clsResult;
-    }
-
-    private GlDisplayRt? ClassifySlow()
+    GlDisplayRt? Classify()
     {
         int clipX = _env.ClipX0, clipY = _env.ClipY0;
         int clipW = _env.ClipX1 - _env.ClipX0 + 1, clipH = _env.ClipY1 - _env.ClipY0 + 1;
@@ -225,49 +194,35 @@ public sealed class GlCore : IGpuBackend
 
         long bestStamp = -1;
         int fbX = 0, fbY = 0, fbW = 0, fbH = 0;
-        for (var i = 0; i < GpuHle.RectCount; i++)
+        for (int i = 0; i < GpuHle.RectCount; i++)
         {
             var r = GpuHle.GetRect(i);
             if (!r.Valid || r.W <= 0 || r.H <= 0 || r.Stamp <= bestStamp) continue;
 
-            var clipInside = clipX >= r.X && clipX + clipW <= r.X + r.W && clipY >= r.Y && clipY + clipH <= r.Y + r.H;
-            var clipIsFb = clipX <= r.X && clipX + clipW >= r.X + r.W && clipY <= r.Y && clipY + clipH >= r.Y + r.H &&
-                           clipW - r.W <= FbSlackW && clipH - r.H <= FbSlackH;
-            if (clipInside)
-            {
-                bestStamp = r.Stamp;
-                fbX = r.X;
-                fbY = r.Y;
-                fbW = r.W;
-                fbH = r.H;
-            }
-            else if (clipIsFb)
-            {
-                bestStamp = r.Stamp;
-                fbX = clipX;
-                fbY = clipY;
-                fbW = clipW;
-                fbH = clipH;
-            }
+            bool clipInside = clipX >= r.X && clipX + clipW <= r.X + r.W &&
+                              clipY >= r.Y && clipY + clipH <= r.Y + r.H;
+            bool clipIsFb = clipX <= r.X && clipX + clipW >= r.X + r.W &&
+                            clipY <= r.Y && clipY + clipH >= r.Y + r.H &&
+                            clipW - r.W <= FbSlackW && clipH - r.H <= FbSlackH;
+            if (clipInside) { bestStamp = r.Stamp; fbX = r.X; fbY = r.Y; fbW = r.W; fbH = r.H; }
+            else if (clipIsFb) { bestStamp = r.Stamp; fbX = clipX; fbY = clipY; fbW = clipW; fbH = clipH; }
         }
-
         return bestStamp < 0 ? null : GetOrCreateRt(fbX, fbY, fbW, fbH);
     }
 
-    private GlDisplayRt GetOrCreateRt(int fbX, int fbY, int fbW, int fbH)
+    GlDisplayRt GetOrCreateRt(int fbX, int fbY, int fbW, int fbH)
     {
-        var slot = -1;
-        for (var i = 0; i < _rts.Length; i++)
+        int slot = -1;
+        for (int i = 0; i < _rts.Length; i++)
             if (_rts[i] is { } rt && rt.X == fbX && rt.Y == fbY)
             {
-                var sameW = rt.W == fbW;
-                var fitsH = rt.H >= fbH && rt.H - fbH <= FbSlackH;
+                bool sameW = rt.W == fbW;
+                bool fitsH = rt.H >= fbH && rt.H - fbH <= FbSlackH;
                 if (sameW && fitsH && rt.Margin == GpuHle.WideMargin(rt.W))
                 {
                     rt.Stamp = ++_rtStamp;
                     return rt;
                 }
-
                 slot = i;
                 break;
             }
@@ -275,14 +230,9 @@ public sealed class GlCore : IGpuBackend
         if (slot < 0)
         {
             slot = 0;
-            for (var i = 1; i < _rts.Length; i++)
+            for (int i = 1; i < _rts.Length; i++)
             {
-                if (_rts[i] == null)
-                {
-                    slot = i;
-                    break;
-                }
-
+                if (_rts[i] == null) { slot = i; break; }
                 if (_rts[slot] != null && _rts[i]!.Stamp < _rts[slot]!.Stamp) slot = i;
             }
         }
@@ -291,23 +241,24 @@ public sealed class GlCore : IGpuBackend
         {
             if (old.Dirty) Writeback(old);
             old.Destroy(_gl);
-            InvalidateClassify();
+            if (old == _lastZRt) _lastZRt = null;
+            // A target thrown away takes its depth attachment with it, so anything
+            // already depth-tested into it stops occluding what comes next. Worth
+            // counting: if this happens inside a frame the Z-buffer is being reset
+            // halfway through one.
+            if (GteDepth.ZBuffer) GteDepth.ZRtRecreated++;
         }
 
-        var fresh = new GlDisplayRt
-        {
-            X = fbX, Y = fbY, W = fbW, H = fbH, Margin = GpuHle.WideMargin(fbW), Stamp = ++_rtStamp,
-            LastDrawFrame = _frame
-        };
+        var fresh = new GlDisplayRt { X = fbX, Y = fbY, W = fbW, H = fbH, Margin = GpuHle.WideMargin(fbW), Stamp = ++_rtStamp, LastDrawFrame = _frame };
         fresh.Create(_gl);
         _rts[slot] = fresh;
         SyncRtFromVram(fresh, fbX, fbY, fbW, fbH);
         return fresh;
     }
 
-    private void Writeback(GlDisplayRt rt)
+    void Writeback(GlDisplayRt rt)
     {
-        var s = GlVram.Scale;
+        int s = GlVram.Scale;
         _gl.Disable(EnableCap.ScissorTest);
         _gl.BindFramebuffer(FramebufferTarget.ReadFramebuffer, rt.Fbo);
         _gl.BindFramebuffer(FramebufferTarget.DrawFramebuffer, _vram.Fbo);
@@ -319,12 +270,12 @@ public sealed class GlCore : IGpuBackend
         Assets.Textures.VramTracker.MarkGpuWrite(rt.X, rt.Y, rt.W, rt.H);
     }
 
-    private void SyncRtFromVram(GlDisplayRt rt, int rx, int ry, int rw, int rh)
+    void SyncRtFromVram(GlDisplayRt rt, int rx, int ry, int rw, int rh)
     {
         int x0 = Math.Max(rx, rt.X), y0 = Math.Max(ry, rt.Y);
         int x1 = Math.Min(rx + rw, rt.X + rt.W), y1 = Math.Min(ry + rh, rt.Y + rt.H);
         if (x0 >= x1 || y0 >= y1) return;
-        var s = GlVram.Scale;
+        int s = GlVram.Scale;
         _gl.Disable(EnableCap.ScissorTest);
         _gl.BindFramebuffer(FramebufferTarget.ReadFramebuffer, _vram.Fbo);
         _gl.BindFramebuffer(FramebufferTarget.DrawFramebuffer, rt.Fbo);
@@ -334,27 +285,25 @@ public sealed class GlCore : IGpuBackend
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
     }
 
-    private void WritebackDirtyIntersecting(int x, int y, int w, int h)
+    void WritebackDirtyIntersecting(int x, int y, int w, int h)
     {
         foreach (var rt in _rts)
-            if (rt is { Dirty: true } && rt.Intersects(x, y, w, h))
-                Writeback(rt);
+            if (rt is { Dirty: true } && rt.Intersects(x, y, w, h)) Writeback(rt);
     }
 
-    private void SyncRtsFromVram(int x, int y, int w, int h)
+    void SyncRtsFromVram(int x, int y, int w, int h)
     {
         foreach (var rt in _rts)
-            if (rt != null && rt.Intersects(x, y, w, h))
-                SyncRtFromVram(rt, x, y, w, h);
+            if (rt != null && rt.Intersects(x, y, w, h)) SyncRtFromVram(rt, x, y, w, h);
     }
 
-    private void CheckTextureFeedback(in PrimFlags f)
+    void CheckTextureFeedback(in PrimFlags f)
     {
         if (!f.Textured || f.UseImage) return;
-        var px = (f.TPage & 0xF) * 64;
-        var py = ((f.TPage >> 4) & 1) * 256;
-        var depth = (f.TPage >> 7) & 3;
-        var pw = depth == 0 ? 64 : depth == 1 ? 128 : 256;
+        int px = (f.TPage & 0xF) * 64;
+        int py = ((f.TPage >> 4) & 1) * 256;
+        int depth = (f.TPage >> 7) & 3;
+        int pw = depth == 0 ? 64 : depth == 1 ? 128 : 256;
         foreach (var rt in _rts)
             if (rt is { Dirty: true } && rt.Intersects(px, py, pw, 256))
             {
@@ -363,97 +312,50 @@ public sealed class GlCore : IGpuBackend
             }
     }
 
-    private bool DesiredMatches(bool transparent, int blend, int image)
+    bool DesiredMatches(bool transparent, int blend, int image, int zMode)
     {
         int twAndX = ~(_env.TwMaskX * 8) & 0xFF, twAndY = ~(_env.TwMaskY * 8) & 0xFF;
         int twOrX = (_env.TwOffX & _env.TwMaskX) * 8, twOrY = (_env.TwOffY & _env.TwMaskY) * 8;
         return _kRepTex == _pendingRepTex && _kRepClut == _pendingRepClut
-                                          && (_pendingRepTex == 0 || (_kRepX == _pendingRepX && _kRepY == _pendingRepY
-                                              && _kRepW == _pendingRepW && _kRepH == _pendingRepH))
-                                          && _kTransparent == transparent && _kBlend == blend && _kImage == image
-                                          && _kSetMask == (_env.SetMask ? 1 : 0) &&
-                                          _kCheckMask == (_env.CheckMask ? 1 : 0)
-                                          && _kTwAndX == twAndX && _kTwAndY == twAndY && _kTwOrX == twOrX &&
-                                          _kTwOrY == twOrY
-                                          && _kClipX0 == _env.ClipX0 && _kClipY0 == _env.ClipY0 &&
-                                          _kClipX1 == _env.ClipX1 && _kClipY1 == _env.ClipY1;
+            && (_pendingRepTex == 0 || (_kRepX == _pendingRepX && _kRepY == _pendingRepY
+                                        && _kRepW == _pendingRepW && _kRepH == _pendingRepH))
+            && _kTransparent == transparent && _kBlend == blend && _kImage == image
+            && _kZMode == zMode
+            && _kSetMask == (_env.SetMask ? 1 : 0) && _kCheckMask == (_env.CheckMask ? 1 : 0)
+            && _kTwAndX == twAndX && _kTwAndY == twAndY && _kTwOrX == twOrX && _kTwOrY == twOrY
+            && _kClipX0 == _env.ClipX0 && _kClipY0 == _env.ClipY0 && _kClipX1 == _env.ClipX1 && _kClipY1 == _env.ClipY1;
     }
 
-    private void Begin(in PrimFlags f, int vertsNeeded)
+    void Begin(in PrimFlags f, int vertsNeeded, int zMode = 0)
     {
-        var transparent = f.SemiTrans;
-        var blend = f.BlendMode;
-        var image = f.UseImage ? f.Image : -1;
+        bool transparent = f.SemiTrans;
+        int blend = f.BlendMode;
+        int image = f.UseImage ? f.Image : -1;
         var target = Classify();
-        if (_count > 0 && (target != _kTarget || !DesiredMatches(transparent, blend, image))) Flush();
+        if (_count > 0 && (target != _kTarget || !DesiredMatches(transparent, blend, image, zMode))) Flush();
         if (_count + vertsNeeded > MaxVerts) Flush();
         CheckTextureFeedback(f);
 
-        if (target != null) ClearMargin(target);
-
         _kTarget = target;
         _kImage = image;
-        _kTransparent = transparent;
-        _kBlend = blend;
-        _kSetMask = _env.SetMask ? 1 : 0;
-        _kCheckMask = _env.CheckMask ? 1 : 0;
-        _kTwAndX = ~(_env.TwMaskX * 8) & 0xFF;
-        _kTwAndY = ~(_env.TwMaskY * 8) & 0xFF;
-        _kTwOrX = (_env.TwOffX & _env.TwMaskX) * 8;
-        _kTwOrY = (_env.TwOffY & _env.TwMaskY) * 8;
-        _kClipX0 = _env.ClipX0;
-        _kClipY0 = _env.ClipY0;
-        _kClipX1 = _env.ClipX1;
-        _kClipY1 = _env.ClipY1;
-        _kRepTex = _pendingRepTex;
-        _kRepClut = _pendingRepClut;
-        _kRepClutCount = _pendingRepClutCount;
-        _kRepX = _pendingRepX;
-        _kRepY = _pendingRepY;
-        _kRepW = _pendingRepW;
-        _kRepH = _pendingRepH;
-
-        if (f.Textured && !f.UseImage && _pendingRepTex == 0)
-        {
-            var depth = (f.TPage >> 7) & 3;
-            AddTexRect((f.TPage & 0xF) * 64, ((f.TPage >> 4) & 1) * 256,
-                depth == 0 ? 64 : depth == 1 ? 128 : 256, 256);
-            if (depth < 2)
-                AddTexRect((f.Clut & 0x3F) * 16, (f.Clut >> 6) & 0x1FF, depth == 0 ? 16 : 256, 1);
-        }
+        _kTransparent = transparent; _kBlend = blend;
+        _kZMode = zMode;
+        _kSetMask = _env.SetMask ? 1 : 0; _kCheckMask = _env.CheckMask ? 1 : 0;
+        _kTwAndX = ~(_env.TwMaskX * 8) & 0xFF; _kTwAndY = ~(_env.TwMaskY * 8) & 0xFF;
+        _kTwOrX = (_env.TwOffX & _env.TwMaskX) * 8; _kTwOrY = (_env.TwOffY & _env.TwMaskY) * 8;
+        _kClipX0 = _env.ClipX0; _kClipY0 = _env.ClipY0; _kClipX1 = _env.ClipX1; _kClipY1 = _env.ClipY1;
+        _kRepTex = _pendingRepTex; _kRepClut = _pendingRepClut; _kRepClutCount = _pendingRepClutCount;
+        _kRepX = _pendingRepX; _kRepY = _pendingRepY; _kRepW = _pendingRepW; _kRepH = _pendingRepH;
     }
 
-    private void AddTexRect(int x, int y, int w, int h)
-    {
-        if (!_kSamplesVram)
-        {
-            _kSamplesVram = true;
-            _kTexX0 = x;
-            _kTexY0 = y;
-            _kTexX1 = x + w;
-            _kTexY1 = y + h;
-            return;
-        }
+    uint _pendingRepTex, _pendingRepClut;
+    int _pendingRepClutCount = 16;
+    float _pendingRepX, _pendingRepY, _pendingRepW = 1, _pendingRepH = 1;
 
-        if (x < _kTexX0) _kTexX0 = x;
-        if (y < _kTexY0) _kTexY0 = y;
-        if (x + w > _kTexX1) _kTexX1 = x + w;
-        if (y + h > _kTexY1) _kTexY1 = y + h;
-    }
+    readonly Dictionary<Assets.ReplacementTexture, uint> _repTextures = [];
+    readonly Dictionary<Assets.ReplacementClut, uint> _repCluts = [];
 
-    private bool SampledRegionIsDirty()
-    {
-        return _vramDirty && _kTexX0 < _vdX1 && _vdX0 < _kTexX1 && _kTexY0 < _vdY1 && _vdY0 < _kTexY1;
-    }
-
-    private uint _pendingRepTex, _pendingRepClut;
-    private int _pendingRepClutCount = 16;
-    private float _pendingRepX, _pendingRepY, _pendingRepW = 1, _pendingRepH = 1;
-
-    private readonly Dictionary<Assets.ReplacementTexture, uint> _repTextures = [];
-    private readonly Dictionary<Assets.ReplacementClut, uint> _repCluts = [];
-
-    private void ResolveReplacement(in PrimFlags f, int uMin, int vMin, int uMax, int vMax)
+    void ResolveReplacement(in PrimFlags f, int uMin, int vMin, int uMax, int vMax)
     {
         _pendingRepTex = 0;
         _pendingRepClut = 0;
@@ -483,9 +385,9 @@ public sealed class GlCore : IGpuBackend
         }
     }
 
-    private unsafe uint EnsureRepTexture(Assets.ReplacementTexture tex)
+    unsafe uint EnsureRepTexture(Assets.ReplacementTexture tex)
     {
-        if (_repTextures.TryGetValue(tex, out var handle)) return handle;
+        if (_repTextures.TryGetValue(tex, out uint handle)) return handle;
 
         _gl.ActiveTexture(TextureUnit.Texture7);
         handle = _gl.GenTexture();
@@ -502,9 +404,9 @@ public sealed class GlCore : IGpuBackend
         return handle;
     }
 
-    private unsafe uint EnsureRepClut(Assets.ReplacementClut clut)
+    unsafe uint EnsureRepClut(Assets.ReplacementClut clut)
     {
-        if (_repCluts.TryGetValue(clut, out var handle)) return handle;
+        if (_repCluts.TryGetValue(clut, out uint handle)) return handle;
 
         _gl.ActiveTexture(TextureUnit.Texture7);
         handle = _gl.GenTexture();
@@ -521,16 +423,33 @@ public sealed class GlCore : IGpuBackend
         return handle;
     }
 
-    private bool DitherOf(in PrimFlags f)
-    {
-        return _env.Dither && (f.Gouraud || (f.Textured && !f.RawTexture));
-    }
+    bool DitherOf(in PrimFlags f) => _env.Dither && (f.Gouraud || (f.Textured && !f.RawTexture));
 
-    private GlVertex V(in HleVertex v, in PrimFlags f, bool dither)
+    // Crossing vertices a single display flip must deliver before the target's
+    // margin counts as carrying a world. See the latch in V.
+    const int MarginVertsToLatch = 32;
+
+    GlVertex V(in HleVertex v, in PrimFlags f, bool dither)
     {
-        var raw = f.Textured && f.RawTexture;
+        // The latch records where the game itself drew past its own edge, and it
+        // takes a world's worth of crossings in one display flip to do it: a
+        // frame of gameplay puts hundreds of vertices out there, while an
+        // oversized clear rect -- genuine game output, and the splash draws one
+        // every MDEC frame -- contributes two. A primitive the widescreen patch
+        // widened crosses the edge by construction and never counts at all.
+        if (!GpuHle.PortWidenedPrim && _kTarget is { Margin: > 0 } && (v.X < _env.ClipX0 || v.X > _env.ClipX1))
+        {
+            if (_kTarget.MarginVertFlip != GpuHle.DisplayFlip)
+            {
+                _kTarget.MarginVertFlip = GpuHle.DisplayFlip;
+                _kTarget.MarginVerts = 0;
+            }
+            if (++_kTarget.MarginVerts >= MarginVertsToLatch)
+                _kTarget.MarginContentFlip = GpuHle.DisplayFlip;
+        }
+        bool raw = f.Textured && f.RawTexture;
         float cr = raw ? 128f : v.R, cg = raw ? 128f : v.G, cb = raw ? 128f : v.B;
-        var tpage = f.UseImage ? 0x4000 : f.Textured ? f.TPage & 0x1FF : 0x8000;
+        int tpage = f.UseImage ? 0x4000 : f.Textured ? (f.TPage & 0x1FF) : 0x8000;
         if (dither && _pendingRepTex == 0) tpage |= 0x400;
         if (_pendingRepTex != 0) tpage |= 0x2000;
         else if (_pendingRepClut != 0) tpage |= 0x1000;
@@ -554,7 +473,8 @@ public sealed class GlCore : IGpuBackend
             Clut = f.Clut & 0x7FFF,
             Texpage = tpage,
             U = v.U, V = v.V,
-            W = v.HasGteZ && v.Z > 0f ? v.Z : 1f
+            W = v.HasPersp && v.Z > 0f ? v.Z : 1f,
+            Z = v.HasGteZ && v.Z > 0f ? v.Z : 0f,
         };
     }
 
@@ -563,11 +483,15 @@ public sealed class GlCore : IGpuBackend
         ResolveReplacement(f,
             (int)Math.Min(a.U, Math.Min(b.U, c.U)), (int)Math.Min(a.V, Math.Min(b.V, c.V)),
             (int)Math.Max(a.U, Math.Max(b.U, c.U)), (int)Math.Max(a.V, Math.Max(b.V, c.V)));
-        Begin(f, 3);
-        var dith = DitherOf(f);
-        _verts[_count++] = V(a, f, dith);
-        _verts[_count++] = V(b, f, dith);
-        _verts[_count++] = V(c, f, dith);
+        // 0 = painter's (2D, or a vertex missed). 1 = opaque 3D, test and write.
+        // 2 = semi-transparent 3D, test but leave Z so overlapping additives still
+        // blend in table order.
+        int zMode = 0;
+        if (a.HasGteZ && b.HasGteZ && c.HasGteZ)
+            zMode = f.SemiTrans ? 2 : 1;
+        Begin(f, 3, zMode);
+        bool dith = DitherOf(f);
+        _verts[_count++] = V(a, f, dith); _verts[_count++] = V(b, f, dith); _verts[_count++] = V(c, f, dith);
     }
 
     public void DrawRect(in HleRect r, in PrimFlags f)
@@ -577,14 +501,9 @@ public sealed class GlCore : IGpuBackend
         var a = new HleVertex { X = r.X, Y = r.Y, R = r.R, G = r.G, B = r.B, U = r.U, V = r.V };
         var b = new HleVertex { X = r.X + r.W, Y = r.Y, R = r.R, G = r.G, B = r.B, U = (short)(r.U + r.W), V = r.V };
         var c = new HleVertex { X = r.X, Y = r.Y + r.H, R = r.R, G = r.G, B = r.B, U = r.U, V = (short)(r.V + r.H) };
-        var d = new HleVertex
-            { X = r.X + r.W, Y = r.Y + r.H, R = r.R, G = r.G, B = r.B, U = (short)(r.U + r.W), V = (short)(r.V + r.H) };
-        _verts[_count++] = V(a, f, false);
-        _verts[_count++] = V(b, f, false);
-        _verts[_count++] = V(c, f, false);
-        _verts[_count++] = V(b, f, false);
-        _verts[_count++] = V(d, f, false);
-        _verts[_count++] = V(c, f, false);
+        var d = new HleVertex { X = r.X + r.W, Y = r.Y + r.H, R = r.R, G = r.G, B = r.B, U = (short)(r.U + r.W), V = (short)(r.V + r.H) };
+        _verts[_count++] = V(a, f, false); _verts[_count++] = V(b, f, false); _verts[_count++] = V(c, f, false);
+        _verts[_count++] = V(b, f, false); _verts[_count++] = V(d, f, false); _verts[_count++] = V(c, f, false);
     }
 
     public void DrawLine(in HleVertex a, in HleVertex b, in PrimFlags f)
@@ -592,51 +511,29 @@ public sealed class GlCore : IGpuBackend
         _pendingRepTex = 0;
         _pendingRepClut = 0;
         Begin(f, 6);
-        var dith = _env.Dither;
+        bool dith = _env.Dither;
         float x1 = a.X, y1 = a.Y;
         float x2 = b.X, y2 = b.Y;
         float dx = x2 - x1, dy = y2 - y1;
 
         if (dx == 0 && dy == 0)
         {
-            LineVert(x1, y1, a, f, dith);
-            LineVert(x1 + 1, y1, a, f, dith);
-            LineVert(x1 + 1, y1 + 1, a, f, dith);
-            LineVert(x1 + 1, y1 + 1, a, f, dith);
-            LineVert(x1, y1 + 1, a, f, dith);
-            LineVert(x1, y1, a, f, dith);
+            LineVert(x1, y1, a, f, dith); LineVert(x1 + 1, y1, a, f, dith); LineVert(x1 + 1, y1 + 1, a, f, dith);
+            LineVert(x1 + 1, y1 + 1, a, f, dith); LineVert(x1, y1 + 1, a, f, dith); LineVert(x1, y1, a, f, dith);
             return;
         }
 
         float xo, yo;
-        if (Math.Abs(dx) > Math.Abs(dy))
-        {
-            xo = 0;
-            yo = 1;
-            if (dx > 0) x2++;
-            else x1++;
-        }
-        else
-        {
-            xo = 1;
-            yo = 0;
-            if (dy > 0) y2++;
-            else y1++;
-        }
+        if (Math.Abs(dx) > Math.Abs(dy)) { xo = 0; yo = 1; if (dx > 0) x2++; else x1++; }
+        else { xo = 1; yo = 0; if (dy > 0) y2++; else y1++; }
 
-        LineVert(x1, y1, a, f, dith);
-        LineVert(x2, y2, b, f, dith);
-        LineVert(x2 + xo, y2 + yo, b, f, dith);
-        LineVert(x2 + xo, y2 + yo, b, f, dith);
-        LineVert(x1 + xo, y1 + yo, a, f, dith);
-        LineVert(x1, y1, a, f, dith);
+        LineVert(x1, y1, a, f, dith); LineVert(x2, y2, b, f, dith); LineVert(x2 + xo, y2 + yo, b, f, dith);
+        LineVert(x2 + xo, y2 + yo, b, f, dith); LineVert(x1 + xo, y1 + yo, a, f, dith); LineVert(x1, y1, a, f, dith);
     }
 
-    private void LineVert(float x, float y, in HleVertex src, in PrimFlags f, bool dither)
+    void LineVert(float x, float y, in HleVertex src, in PrimFlags f, bool dither)
     {
-        var v = src;
-        v.X = x;
-        v.Y = y;
+        var v = src; v.X = x; v.Y = y;
         _verts[_count++] = V(v, f, dither);
     }
 
@@ -652,42 +549,23 @@ public sealed class GlCore : IGpuBackend
                 FillRtFull(rt, color15);
                 rt.Dirty = false;
                 rt.LastDrawFrame = _frame;
+                if (rt.Margin > 0) rt.MarginContentFlip = GpuHle.DisplayFlip;
             }
-            else
-            {
-                SyncRtFromVram(rt, x, y, w, h);
-            }
+            else SyncRtFromVram(rt, x, y, w, h);
         }
     }
 
-    private void ClearMargin(GlDisplayRt rt)
-    {
-        if (rt.Margin <= 0 || rt.LastMarginFrame == _frame) return;
-        rt.LastMarginFrame = _frame;
-
-        var s = GlVram.Scale;
-        var left = rt.Margin * s;
-        var right = (rt.Margin + rt.W) * s;
-
-        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, rt.Fbo);
-        _gl.ClearColor(0f, 0f, 0f, 0f);
-        _gl.Enable(EnableCap.ScissorTest);
-        _gl.Scissor(0, 0, (uint)left, (uint)rt.TexH);
-        _gl.Clear(ClearBufferMask.ColorBufferBit);
-        _gl.Scissor(right, 0, (uint)(rt.TexW - right), (uint)rt.TexH);
-        _gl.Clear(ClearBufferMask.ColorBufferBit);
-        _gl.Disable(EnableCap.ScissorTest);
-        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
-    }
-
-    private void FillRtFull(GlDisplayRt rt, ushort color15)
+    void FillRtFull(GlDisplayRt rt, ushort color15)
     {
         float r = (color15 & 0x1F) / 31f, g = ((color15 >> 5) & 0x1F) / 31f, b = ((color15 >> 10) & 0x1F) / 31f;
-        var a = (color15 & 0x8000) != 0 ? 1f : 0f;
+        float a = (color15 & 0x8000) != 0 ? 1f : 0f;
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, rt.Fbo);
         _gl.Disable(EnableCap.ScissorTest);
         _gl.ClearColor(r, g, b, a);
-        _gl.Clear(ClearBufferMask.ColorBufferBit);
+        _gl.ClearDepth(1.0);
+        _gl.DepthMask(true);
+        _gl.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
+        rt.ZGen = GteDepth.Generation;
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
     }
 
@@ -716,7 +594,7 @@ public sealed class GlCore : IGpuBackend
     public int RegisterImage(ReadOnlySpan<byte> rgba, int width, int height)
     {
         _gl.ActiveTexture(TextureUnit.Texture7);
-        var t = _gl.GenTexture();
+        uint t = _gl.GenTexture();
         _gl.BindTexture(TextureTarget.Texture2D, t);
         _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)GLEnum.Nearest);
         _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)GLEnum.Nearest);
@@ -747,9 +625,8 @@ public sealed class GlCore : IGpuBackend
             _gl.Viewport(0, 0, (uint)rt.TexW, (uint)rt.TexH);
             destTex = rt.Tex;
         }
-
-        var destW = rt == null ? GlVram.Width : rt.TexW;
-        var destH = rt == null ? GlVram.Height : rt.TexH;
+        int destW = rt == null ? GlVram.Width : rt.TexW;
+        int destH = rt == null ? GlVram.Height : rt.TexH;
 
         GpuGlAccess.Gl = _gl;
         GpuGlAccess.TargetFbo = rt == null ? _vram.Fbo : rt.Fbo;
@@ -759,36 +636,54 @@ public sealed class GlCore : IGpuBackend
         GpuGlAccess.TargetOriginY = rt == null ? 0 : rt.Y;
         GpuGlAccess.TargetMargin = rt == null ? 0 : rt.Margin;
 
-        _gl.Disable(EnableCap.DepthTest);
         _gl.Disable(EnableCap.CullFace);
         _gl.Enable(EnableCap.ScissorTest);
-        var s = GlVram.Scale;
+        int s = GlVram.Scale;
+
+        // Depth test is per-batch: opaque 3D writes, semi-transparent 3D tests
+        // without writing, 2D (and everything while the setting is off) keeps
+        // the console's painter's algorithm. First draw onto an RT after Present
+        // — or after the setting was flipped — clears the attachment so last
+        // frame's depths cannot occlude this one. The clear is not gated on this
+        // batch's mode, so a 2D primitive arriving first cannot skip it.
+        if (rt != null && GteDepth.ZBuffer && (rt.LastDrawFrame != _frame || rt.ZGen != GteDepth.Generation))
+        {
+            _gl.Disable(EnableCap.ScissorTest);
+            _gl.DepthMask(true);
+            _gl.ClearDepth(1.0);
+            _gl.Clear(ClearBufferMask.DepthBufferBit);
+            _gl.Enable(EnableCap.ScissorTest);
+            rt.ZGen = GteDepth.Generation;
+        }
+        if (_kZMode != 0)
+        {
+            if (rt != null) { GteDepth.ZBatchRt++; _lastZRt = rt; } else GteDepth.ZBatchVram++;
+            _gl.Enable(EnableCap.DepthTest);
+            _gl.DepthFunc(DepthFunction.Lequal);
+            _gl.DepthMask(_kZMode == 1);
+        }
+        else
+        {
+            _gl.Disable(EnableCap.DepthTest);
+            _gl.DepthMask(false);
+        }
 
         int clipX0, clipY0, clipX1, clipY1;
         if (rt == null)
         {
-            clipX0 = _kClipX0;
-            clipY0 = _kClipY0;
-            clipX1 = _kClipX1;
-            clipY1 = _kClipY1;
+            clipX0 = _kClipX0; clipY0 = _kClipY0; clipX1 = _kClipX1; clipY1 = _kClipY1;
         }
         else
         {
-            clipX0 = _kClipX0 - rt.X + rt.Margin;
-            clipY0 = _kClipY0 - rt.Y;
-            clipX1 = _kClipX1 - rt.X + rt.Margin;
-            clipY1 = _kClipY1 - rt.Y;
-            if (rt.Margin > 0 && _kClipX0 <= rt.X && _kClipX1 >= rt.X + rt.W - 1)
-            {
-                clipX0 = 0;
-                clipX1 = rt.Wide1x - 1;
-            }
+            clipX0 = _kClipX0 - rt.X + rt.Margin; clipY0 = _kClipY0 - rt.Y;
+            clipX1 = _kClipX1 - rt.X + rt.Margin; clipY1 = _kClipY1 - rt.Y;
+            if (rt.Margin > 0 && _kClipX0 <= rt.X && _kClipX1 >= rt.X + rt.W - 1) { clipX0 = 0; clipX1 = rt.Wide1x - 1; }
         }
 
-        var bx0 = (int)Math.Floor(_drawMinX) + (rt == null ? 0 : rt.Margin - rt.X);
-        var by0 = (int)Math.Floor(_drawMinY) - (rt == null ? 0 : rt.Y);
-        var bx1 = (int)Math.Ceiling(_drawMaxX) + (rt == null ? 0 : rt.Margin - rt.X);
-        var by1 = (int)Math.Ceiling(_drawMaxY) - (rt == null ? 0 : rt.Y);
+        int bx0 = (int)Math.Floor(_drawMinX) + (rt == null ? 0 : rt.Margin - rt.X);
+        int by0 = (int)Math.Floor(_drawMinY) - (rt == null ? 0 : rt.Y);
+        int bx1 = (int)Math.Ceiling(_drawMaxX) + (rt == null ? 0 : rt.Margin - rt.X);
+        int by1 = (int)Math.Ceiling(_drawMaxY) - (rt == null ? 0 : rt.Y);
 
         int rx0 = Math.Max(clipX0, bx0), ry0 = Math.Max(clipY0, by0);
         int rx1 = Math.Min(clipX1, bx1), ry1 = Math.Min(clipY1, by1);
@@ -796,22 +691,12 @@ public sealed class GlCore : IGpuBackend
         _gl.Scissor(clipX0 * s, clipY0 * s,
             (uint)Math.Max(0, (clipX1 - clipX0 + 1) * s), (uint)Math.Max(0, (clipY1 - clipY0 + 1) * s));
 
-        var readX = Math.Max(0, rx0 * s);
-        var readY = Math.Max(0, ry0 * s);
-        var readW = Math.Max(0, (rx1 - rx0 + 1) * s);
-        var readH = Math.Max(0, (ry1 - ry0 + 1) * s);
-        var needDest = _legacy || _kCheckMask != 0;
-        if (needDest)
-        {
-            destTex = _vram.BeginDestRead(destTex, destW, destH, readX, readY, readW, readH);
-            RebindTarget(rt);
-            _vramDirty = false;
-        }
-        else if (rt == null && _kSamplesVram && SampledRegionIsDirty())
-        {
-            _vram.SampleBarrier();
-            _vramDirty = false;
-        }
+        int readX = Math.Max(0, rx0 * s);
+        int readY = Math.Max(0, ry0 * s);
+        int readW = Math.Max(0, (rx1 - rx0 + 1) * s);
+        int readH = Math.Max(0, (ry1 - ry0 + 1) * s);
+        destTex = _vram.BeginDestRead(destTex, destW, destH, readX, readY, readW, readH);
+        RebindTarget(rt);
 
         _gl.UseProgram(_progPrim);
         _gl.BindVertexArray(_vao);
@@ -824,25 +709,22 @@ public sealed class GlCore : IGpuBackend
             _gl.ActiveTexture(TextureUnit.Texture2);
             _gl.BindTexture(TextureTarget.Texture2D, _images[_kImage]);
         }
-
         if (_kRepTex != 0)
         {
             _gl.ActiveTexture(TextureUnit.Texture3);
             _gl.BindTexture(TextureTarget.Texture2D, _kRepTex);
             _gl.Uniform4(_uRepRect, _kRepX, _kRepY, _kRepW, _kRepH);
         }
-
         if (_kRepClut != 0)
         {
             _gl.ActiveTexture(TextureUnit.Texture4);
             _gl.BindTexture(TextureTarget.Texture2D, _kRepClut);
             _gl.Uniform1(_uRepClutCount, (float)_kRepClutCount);
         }
-
         _gl.ActiveTexture(TextureUnit.Texture0);
         if (rt != null)
         {
-            _gl.Uniform2(_uPosBias, (float)(rt.Margin - rt.X), (float)-rt.Y);
+            _gl.Uniform2(_uPosBias, (float)(rt.Margin - rt.X), (float)(-rt.Y));
             _gl.Uniform2(_uFbInv, 2f / rt.Wide1x, 2f / rt.H);
         }
         else
@@ -850,7 +732,7 @@ public sealed class GlCore : IGpuBackend
             _gl.Uniform2(_uPosBias, 0f, 0f);
             _gl.Uniform2(_uFbInv, 2f / VramShadow.Width, 2f / VramShadow.Height);
         }
-
+        if (_uTrueColor >= 0) _gl.Uniform1(_uTrueColor, GteDepth.TrueColor ? 1f : 0f);
         if (_legacy)
         {
             _gl.Uniform4(_uTexWindow, (float)_kTwAndX, _kTwAndY, _kTwOrX, _kTwOrY);
@@ -884,20 +766,15 @@ public sealed class GlCore : IGpuBackend
         else
         {
             _gl.Enable(EnableCap.Blend);
-            _gl.BlendFuncSeparate(BlendingFactor.Src1Color, BlendingFactor.Src1Alpha, BlendingFactor.One,
-                BlendingFactor.Zero);
+            _gl.BlendFuncSeparate(BlendingFactor.Src1Color, BlendingFactor.Src1Alpha, BlendingFactor.One, BlendingFactor.Zero);
             if (_kBlend == 2)
             {
                 _gl.BlendEquation(BlendEquationModeEXT.FuncAdd);
                 SetBlend(0f, 1f);
                 _gl.DrawArrays(PrimitiveType.Triangles, 0, (uint)_count);
 
-                if (needDest)
-                {
-                    _vram.BeginDestRead(destTex, destW, destH, readX, readY, readW, readH);
-                    RebindTarget(rt);
-                }
-
+                _vram.BeginDestRead(destTex, destW, destH, readX, readY, readW, readH);
+                RebindTarget(rt);
                 _gl.BlendEquationSeparate(BlendEquationModeEXT.FuncReverseSubtract, BlendEquationModeEXT.FuncAdd);
                 SetBlend(1f, 1f);
                 _gl.Uniform4(_uBlendOpaque, 0f, 0f, 0f, 1f);
@@ -912,56 +789,50 @@ public sealed class GlCore : IGpuBackend
         }
 
         _gl.Disable(EnableCap.ScissorTest);
-        if (rt != null)
-        {
-            rt.Dirty = true;
-            rt.LastDrawFrame = _frame;
-        }
+        if (rt != null) { rt.Dirty = true; rt.LastDrawFrame = _frame; }
         else
         {
-            var x0 = Math.Max(_kClipX0, (int)Math.Floor(_drawMinX));
-            var y0 = Math.Max(_kClipY0, (int)Math.Floor(_drawMinY));
-            var x1 = Math.Min(_kClipX1, (int)Math.Ceiling(_drawMaxX));
-            var y1 = Math.Min(_kClipY1, (int)Math.Ceiling(_drawMaxY));
+            int x0 = Math.Max(_kClipX0, (int)Math.Floor(_drawMinX));
+            int y0 = Math.Max(_kClipY0, (int)Math.Floor(_drawMinY));
+            int x1 = Math.Min(_kClipX1, (int)Math.Ceiling(_drawMaxX));
+            int y1 = Math.Min(_kClipY1, (int)Math.Ceiling(_drawMaxY));
             if (x1 >= x0 && y1 >= y0)
-            {
                 Assets.Textures.VramTracker.MarkGpuWrite(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
-                if (!_vramDirty)
-                {
-                    _vramDirty = true;
-                    _vdX0 = x0;
-                    _vdY0 = y0;
-                    _vdX1 = x1 + 1;
-                    _vdY1 = y1 + 1;
-                }
-                else
-                {
-                    if (x0 < _vdX0) _vdX0 = x0;
-                    if (y0 < _vdY0) _vdY0 = y0;
-                    if (x1 + 1 > _vdX1) _vdX1 = x1 + 1;
-                    if (y1 + 1 > _vdY1) _vdY1 = y1 + 1;
-                }
-            }
         }
-
         _count = 0;
-        _kSamplesVram = false;
     }
 
-    private void SetBlend(float src, float dst)
-    {
-        _gl.Uniform4(_uBlend, src, src, src, dst);
-    }
+    void SetBlend(float src, float dst) => _gl.Uniform4(_uBlend, src, src, src, dst);
 
-    private void SetScaleUniform(uint prog)
+    void SetScaleUniform(uint prog)
     {
-        var loc = _gl.GetUniformLocation(prog, "uScale");
+        int loc = _gl.GetUniformLocation(prog, "uScale");
         if (loc < 0) return;
         if (_legacy) _gl.Uniform1(loc, (float)GlVram.Scale);
         else _gl.Uniform1(loc, GlVram.Scale);
     }
 
-    private void RebindTarget(GlDisplayRt? rt)
+    /// <summary>Read the finished frame's depth attachment back and hand it to
+    /// GteDepth to reduce. Diagnostic only, one frame when asked: it stalls the
+    /// pipeline, and it is the only way to see what the Z-buffer actually decided
+    /// rather than what the submission order suggests it should have.</summary>
+    unsafe void CaptureDepthMap(GlDisplayRt rt)
+    {
+        int w = rt.TexW, h = rt.TexH;
+        if (w <= 0 || h <= 0) return;
+
+        var buf = new float[(long)w * h];
+        _gl.Disable(EnableCap.ScissorTest);
+        _gl.BindFramebuffer(FramebufferTarget.ReadFramebuffer, rt.Fbo);
+        _gl.PixelStore(PixelStoreParameter.PackAlignment, 4);
+        fixed (float* p = buf)
+            _gl.ReadPixels(0, 0, (uint)w, (uint)h, PixelFormat.DepthComponent, PixelType.Float, p);
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+
+        GteDepth.SetDepthMap(buf, w, h);
+    }
+
+    void RebindTarget(GlDisplayRt? rt)
     {
         if (rt == null)
         {
@@ -975,19 +846,51 @@ public sealed class GlCore : IGpuBackend
         }
     }
 
-    public void Present(in HleDispEnv disp)
+    public void ClearMarginLatches()
     {
-        PresentDisplay(disp.X, disp.Y, disp.W, disp.H, disp.Rgb24);
+        foreach (var t in _rts)
+        {
+            if (t == null) continue;
+            t.MarginContentFlip = -1000;
+            t.MarginVerts = 0;
+            t.MarginVertFlip = -1;
+        }
     }
 
-    public unsafe (uint tex, int w, int h, float aspect) PresentDisplay(int dispX, int dispY, int w, int h,
-        bool rgb24 = false, int outW = 0, int outH = 0)
+    public void Present(in HleDispEnv disp) => PresentDisplay(disp.X, disp.Y, disp.W, disp.H, disp.Rgb24);
+
+    public unsafe (uint tex, int w, int h, float aspect) PresentDisplay(int dispX, int dispY, int w, int h, bool rgb24 = false, int outW = 0, int outH = 0)
     {
         if (!Ready || w <= 0 || h <= 0) return (0, 0, 0, GpuHle.OutputAspect);
-
+        // Flush before advancing the counter. The depth clear keys on
+        // LastDrawFrame != _frame, so bumping the frame first makes this trailing
+        // flush — the tail of the frame that is ending — look like the head of the
+        // next one: it clears the depth buffer and stamps the new frame number, so
+        // the next frame's real first draw skips its clear and inherits whatever
+        // this last batch wrote.
         Flush();
+        _frame++;
 
-        for (var i = 0; i < _rts.Length; i++)
+        // True color was toggled: the live targets have the wrong pixel format.
+        // Flush already drained this frame's batch, so no draw is mid-flight; write
+        // each target's content back to VRAM and drop it. The next draw recreates
+        // it in the new format and re-syncs from VRAM, and this present falls back
+        // to VRAM (which just received the writeback) for the one transition frame.
+        if (_rtsTrueColor != GteDepth.TrueColor)
+        {
+            _rtsTrueColor = GteDepth.TrueColor;
+            for (int i = 0; i < _rts.Length; i++)
+                if (_rts[i] is { } rt)
+                {
+                    if (rt.Dirty) Writeback(rt);
+                    rt.Destroy(_gl);
+                    _rts[i] = null;
+                }
+            _kTarget = null;
+            _lastZRt = null;
+        }
+
+        for (int i = 0; i < _rts.Length; i++)
         {
             if (_rts[i] is not { } rt) continue;
             if (rt.Dirty) Writeback(rt);
@@ -1002,23 +905,66 @@ public sealed class GlCore : IGpuBackend
         if (!rgb24)
             foreach (var rt in _rts)
             {
-                if (rt == null || _frame - rt.LastDrawFrame > 4) continue;
+                // No freshness gate on the present counter: the host can present
+                // many times between two drawn frames -- VSync off, or a monitor
+                // refresh the game's 30 fps cannot match -- and a count-based gate
+                // then rejects both targets and drops the picture to the plain
+                // VRAM texture at 4:3, which is the wide margins flashing black.
+                // Writeback above copies every dirty target's middle columns into
+                // VRAM on every present and WriteVram syncs direct writes back
+                // into targets, so a target containing the display area is never
+                // staler than the fallback it replaces; idle targets are
+                // destroyed at 300 frames below.
+                if (rt == null) continue;
                 if (dispX < rt.X || dispY < rt.Y || dispX + w > rt.X + rt.W || dispY + h > rt.Y + rt.H) continue;
                 if (src == null || rt.LastDrawFrame > src.LastDrawFrame) src = rt;
             }
+        // A wide target whose margin columns no scene has ever drawn would present
+        // invented picture at the sides -- the boot splash, whose frames arrive by
+        // MDEC, flapped between such a target and the 4:3 fallback. Refuse targets
+        // that never latched margin content; a target that did keeps serving, which
+        // is what keeps the in-game menu, dialogs, shops and signs wide instead of
+        // collapsing to the 320-wide 4:3 fallback the moment the world render stops.
+        if (src is { Margin: > 0 } && src.MarginContentFlip < 0)
+            src = null;
+        // Only the non-rgb24 path searches for a target, so src is meaningful only
+        // there; an rgb24 present (FMV) draws raw VRAM by a different route and would
+        // otherwise be miscounted as the 4:3 margin fallback the census is watching for.
+        if (GpuHle.PresentProbe && !rgb24)
+        {
+            if (src is { Margin: > 0 }) GpuHle.PresentWide++;
+            else if (src != null) GpuHle.PresentPlain++;
+            else GpuHle.PresentFallback++;
+            double now = Environment.TickCount64 / 1000.0;
+            if (now - GpuHle.PresentWindowStart >= 2.0)
+            {
+                Console.WriteLine($"[present] wide {GpuHle.PresentWide}, plain {GpuHle.PresentPlain}, " +
+                                  $"vram fallback {GpuHle.PresentFallback}");
+                GpuHle.PresentWide = GpuHle.PresentPlain = GpuHle.PresentFallback = 0;
+                GpuHle.PresentWindowStart = now;
+            }
+        }
 
-        var w1x = src != null ? w + src.Margin * 2 : w;
-        var h1x = h;
-        var aspect = src is { Margin: > 0 } ? GpuHle.WideAspect :
-            src != null ? GpuHle.SourceAspect : GpuHle.OutputAspect;
+        // The target the frame's depth batches actually went to — not the one being
+        // presented (with two buffers that is last frame's) and not the most
+        // recently drawn (a full-screen fill stamps LastDrawFrame too, so that can
+        // be a buffer which was just cleared).
+        // A target that has since been destroyed has Fbo 0, which is the *default*
+        // framebuffer — reading that would report an empty depth buffer rather than
+        // no answer. Leave the request standing and try the next frame instead.
+        if (GteDepth.WantDepthMap && _lastZRt is { Fbo: not 0 }) CaptureDepthMap(_lastZRt);
+
+        int w1x = src != null ? w + src.Margin * 2 : w;
+        int h1x = h;
+        float aspect = src is { Margin: > 0 } ? GpuHle.WideAspect : src != null ? GpuHle.SourceAspect : GpuHle.OutputAspect;
 
 
         GpuHle.LastDisplayW = w;
         GpuHle.LastDisplayH = h;
 
-        var presentScale = GlVram.Scale;
-        var fbW = w1x * presentScale;
-        var fbH = h1x * presentScale;
+        int presentScale = GlVram.Scale;
+        int fbW = w1x * presentScale;
+        int fbH = h1x * presentScale;
         EnsurePresentSize(fbW, fbH, GlVram.Scale == 1);
 
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _presentFbo);
@@ -1049,17 +995,16 @@ public sealed class GlCore : IGpuBackend
             _gl.Uniform2(_uPresentSize, (float)w, h);
             _gl.Uniform2(_uPresentTexSize, (float)VramShadow.Width, VramShadow.Height);
         }
-
         _gl.DrawArrays(PrimitiveType.TriangleStrip, 0, 4);
 
-        var outTex = ApplyPostFx(_presentTex, fbW, fbH);
+        uint outTex = ApplyPostFx(_presentTex, fbW, fbH);
 
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
         return (outTex, fbW, fbH, aspect);
     }
-
+    
     //support for post-fx shaders to be loaded, so you can have cool shaders (this was too anonying to implement)
-    private unsafe uint ApplyPostFx(uint srcTex, int w, int h)
+    unsafe uint ApplyPostFx(uint srcTex, int w, int h)
     {
         if (!PostFx.Active) return srcTex;
         if (!EnsurePostProgram()) return srcTex;
@@ -1074,7 +1019,6 @@ public sealed class GlCore : IGpuBackend
             _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
             _postFbo = _gl.GenFramebuffer();
         }
-
         if (w != _postW || h != _postH)
         {
             _gl.BindTexture(TextureTarget.Texture2D, _postTex);
@@ -1083,8 +1027,7 @@ public sealed class GlCore : IGpuBackend
             _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _postFbo);
             _gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
                 TextureTarget.Texture2D, _postTex, 0);
-            _postW = w;
-            _postH = h;
+            _postW = w; _postH = h;
         }
 
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _postFbo);
@@ -1107,39 +1050,34 @@ public sealed class GlCore : IGpuBackend
         return _postTex;
     }
 
-    private void ApplyPostParams()
+    void ApplyPostParams()
     {
-        var version = PostFx.ParamVersion;
+        int version = PostFx.ParamVersion;
         if (version != _postParamVersion)
         {
             _postParamVersion = version;
             _postParams = PostFx.SnapshotParams();
             _postParamLoc = new int[_postParams.Length];
-            for (var i = 0; i < _postParams.Length; i++)
+            for (int i = 0; i < _postParams.Length; i++)
                 _postParamLoc[i] = _gl.GetUniformLocation(_postProg, _postParams[i].Name);
         }
 
-        for (var i = 0; i < _postParams.Length; i++)
-            if (_postParamLoc[i] >= 0)
-                _gl.Uniform1(_postParamLoc[i], _postParams[i].Value);
+        for (int i = 0; i < _postParams.Length; i++)
+            if (_postParamLoc[i] >= 0) _gl.Uniform1(_postParamLoc[i], _postParams[i].Value);
     }
 
-    private bool EnsurePostProgram()
+    bool EnsurePostProgram()
     {
-        var version = PostFx.Version;
+        int version = PostFx.Version;
         if (version == _postVersion) return _postProg != 0;
         _postVersion = version;
 
-        if (_postProg != 0)
-        {
-            _gl.DeleteProgram(_postProg);
-            _postProg = 0;
-        }
+        if (_postProg != 0) { _gl.DeleteProgram(_postProg); _postProg = 0; }
 
-        var src = PostFx.Source;
+        string? src = PostFx.Source;
         if (src == null) return false;
 
-        _postProg = GlShaders.Build(_gl, GlShaders.FullscreenVs, src, "postfx", out var error);
+        _postProg = GlShaders.Build(_gl, GlShaders.FullscreenVs, src, "postfx", out string? error);
         if (_postProg == 0)
         {
             PostFx.Error = error ?? "shader fails to build";
@@ -1158,18 +1096,15 @@ public sealed class GlCore : IGpuBackend
         return true;
     }
 
-    private unsafe void EnsurePresentSize(int w, int h, bool nearest)
+    unsafe void EnsurePresentSize(int w, int h, bool nearest)
     {
         if (w == _presentW && h == _presentH && nearest == _presentNearest) return;
         _gl.BindTexture(TextureTarget.Texture2D, _presentTex);
-        _gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.Rgba8, (uint)w, (uint)h, 0, PixelFormat.Rgba,
-            PixelType.UnsignedByte, null);
+        _gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.Rgba8, (uint)w, (uint)h, 0, PixelFormat.Rgba, PixelType.UnsignedByte, null);
         var filter = nearest ? GLEnum.Nearest : GLEnum.Linear;
         _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)filter);
         _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)filter);
-        _presentW = w;
-        _presentH = h;
-        _presentNearest = nearest;
+        _presentW = w; _presentH = h; _presentNearest = nearest;
     }
 
     public void Dispose()

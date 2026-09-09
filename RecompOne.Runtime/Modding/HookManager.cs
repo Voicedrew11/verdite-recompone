@@ -170,6 +170,25 @@ public static class HookManager
         }
     }
 
+    public static bool IsRegistered(MethodInfo target)
+    {
+        lock (_gate)
+            return _hooks.ContainsKey(target);
+    }
+
+    public static bool IsCommitted(MethodInfo target)
+    {
+        lock (_gate)
+            return _hooks.TryGetValue(target, out var hooks) && hooks.Hook != null;
+    }
+
+    //Installing a detour is the one step here that is not bookkeeping, and it is
+    //the one that can throw. It used to throw straight out of this loop, which
+    //abandoned every function after it in the dictionary -- silently, because a
+    //caller hooking from an event listener has its exception swallowed by
+    //Event.Dispatch. A mod losing one hook is a mod losing one hook; a mod losing
+    //the rest of its hooks because of it is a different bug every time. Each
+    //function is therefore committed on its own, and a failure is named.
     public static void Commit()
     {
         lock (_gate)
@@ -178,9 +197,21 @@ public static class HookManager
             {
                 if (hooks.Hook != null) continue;
                 var state = hooks;
-                hooks.Hook = new Hook(target,
-                    (Action<Action<CpuContext, IMemory>, CpuContext, IMemory>)
-                    ((orig, c, m) => Invoke(state, orig, c, m)));
+                // 0027. Upstream installs each detour with no guard, so the
+                // first `new Hook` that throws abandons every function after it
+                // in the dictionary -- silently, because the exception is
+                // swallowed by Event.Dispatch into one stderr line.
+                try
+                {
+                    hooks.Hook = new Hook(target,
+                        (Action<Action<CpuContext, IMemory>, CpuContext, IMemory>)
+                        ((orig, c, m) => Invoke(state, orig, c, m)));
+                }
+                catch (Exception e)
+                {
+                    Console.Error.WriteLine(
+                        $"[Mods] could not hook {target.DeclaringType?.Name}.{target.Name}: {e.Message}");
+                }
             }
         }
     }

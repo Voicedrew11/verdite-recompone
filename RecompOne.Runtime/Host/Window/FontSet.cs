@@ -4,6 +4,21 @@ using ImGuiNET;
 
 namespace RecompOne.Runtime.Host.Window;
 
+/// <summary>
+/// The interface's fonts: a scalable sans for the text, Font Awesome merged over
+/// it for the icons.
+///
+/// One deviation from upstream, and it is in the csproj rather than here: **the
+/// CJK resource is not embedded.** NotoSansCJK-Regular.otf is 16.5 MB, and every
+/// string in the runtime's three languages (en, pt-BR, es-419) is Latin, so it
+/// would cost 16 MB in the assembly and in every release artifact to render
+/// nothing anyone can select. The load below is left exactly as upstream wrote
+/// it -- LoadResource returns null for a resource that is not embedded, so the
+/// block is inert -- which keeps this file identical to upstream and so out of
+/// every future merge. Re-embedding the .otf in the csproj is the whole of
+/// turning it back on. Cyrillic, Greek and Vietnamese are kept, being Noto
+/// Sans's own coverage and only atlas space.
+/// </summary>
 public static class FontSet
 {
     private const string IconResource = "RecompOne.Runtime.Host.Window.Assets.fa-solid-900.ttf";

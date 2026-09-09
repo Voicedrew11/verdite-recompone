@@ -279,6 +279,9 @@ public static class HostWindow
     {
         _gpu = gpu;
         if (_headless || _window == null) return;
+        // 0007. The pad is polled outside the frame loop, so a game that waits
+        // on it without vsyncing does not read one frozen snapshot forever.
+        _pumpedAt = _renderedAt = _pumpClock.Elapsed.TotalMilliseconds;
         try
         {
             _window.DoEvents();
@@ -378,6 +381,38 @@ public static class HostWindow
         _window.DoRender();
     }
 
+    static readonly System.Diagnostics.Stopwatch _pumpClock = System.Diagnostics.Stopwatch.StartNew();
+    static double _pumpedAt = double.NegativeInfinity;
+    static double _renderedAt = double.NegativeInfinity;
+
+    /// <summary>
+    /// Take in host events and refresh the pad, without waiting for a frame.
+    ///
+    /// For code that runs outside the frame loop: a game busy-waiting on the
+    /// controller never reaches Present, and input that is only polled there can
+    /// never change under it. Does nothing if the host was pumped less than
+    /// minIntervalMs ago, so a caller in a tight loop is free to ask every time.
+    /// </summary>
+    internal static void PumpInput(double minIntervalMs)
+    {
+        if (_headless || _window == null) return;
+        double now = _pumpClock.Elapsed.TotalMilliseconds;
+        if (now - _pumpedAt < minIntervalMs) return;
+        _pumpedAt = now;
+
+        try { _window.DoEvents(); } catch { }
+        if (_window.IsClosing) { Runtime.Shutdown(); Environment.Exit(0); }
+        InputManager.Poll();
+
+        // Keep drawing while the game is stuck outside its frame loop, so the UI
+        // stays live rather than going grey -- but at display rate, not at the
+        // rate the game happens to poll the pad. Present() stamps this too, so a
+        // game that is running normally never renders twice in a frame.
+        if (now - _renderedAt < 16.0) return;
+        _renderedAt = now;
+        _window.DoRender();
+    }
+
     public static void Shutdown()
     {
         if (!_headless && _window != null && !_window.IsClosing)
@@ -412,6 +447,39 @@ public static class HostWindow
     {
         return InputManager.IsKeyDown(k);
     }
+
+    // The pad, for a port that draws its own binding table. Both of these are
+    // public on InputManager already and the class is internal, so unlike the
+    // mouse block below nothing had to be added there -- these two forwards are
+    // the whole of the reach.
+    public static bool IsPadConnected(int pad) => InputManager.IsPadConnected(pad);
+
+    /// <summary>The first pad button held down right now, or null. Face and
+    /// shoulder buttons are their SDL index, the triggers are 100/101 and the
+    /// stick directions 102-109 -- the encoding <c>GamepadBindings</c> stores
+    /// and a binding table has to display, so a caller needs no second table to
+    /// interpret the answer.</summary>
+    public static int? GetFirstPressedPadButton(int pad = 0) => InputManager.GetFirstPressedPadButton(pad);
+
+    // The mouse, for a port that wants to steer with it. InputManager owns the
+    // IMouse and is internal, so these are the way out of the assembly -- the
+    // same role IsKeyDown already plays for the keyboard.
+    public static bool MouseAvailable => InputManager.MouseAvailable;
+
+    /// <summary>Lock the pointer to the window and hide it, or give it back.
+    /// Read it back after setting it: a platform that refuses the mode leaves
+    /// this false.</summary>
+    public static bool MouseCaptured
+    {
+        get => InputManager.MouseCaptured;
+        set => InputManager.MouseCaptured = value;
+    }
+
+    /// <summary>Motion since the last call, in window pixels, and cleared by
+    /// it.</summary>
+    public static (float X, float Y) TakeMouseMotion() => InputManager.TakeMouseMotion();
+
+    public static bool IsMouseButtonDown(MouseButton button) => InputManager.IsMouseButtonDown(button);
 
     public static void RequestDiscPath()
     {
@@ -624,6 +692,29 @@ public static class HostWindow
     {
         var gl = _gl!;
         _imgui!.Update((float)dt);
+
+        // 0018. Silk's ImGuiController computes io.DisplayFramebufferScale as
+        // FramebufferSize / window size with both sides int, so the ratio
+        // truncates before it is ever a float. On a display the compositor runs
+        // at a fractional scale -- KDE's 1.15, say -- the framebuffer is 1.15x
+        // the logical window and 1.15 becomes 1. RenderImDrawData then sizes
+        // both its GL viewport and every scissor rect from DisplaySize *
+        // FramebufferScale, so the whole interface is drawn into a logical-sized
+        // box in the bottom-left of a larger framebuffer: dead margins along the
+        // top and right, and the panels clipped where they cross them. An
+        // integer scale divides exactly, which is why this is invisible on a
+        // 1:1 monitor and only appears on the fractionally scaled one.
+        //
+        // Update() has already run NewFrame, so layout for this frame is fixed
+        // and still in logical units -- input is untouched, and this only
+        // restores the mapping onto the framebuffer. Render() reads
+        // io.DisplayFramebufferScale when it fills the draw data, so setting it
+        // anywhere between the two is what the backend sees.
+        var wsz = _window!.Size;
+        var wfb = _window.FramebufferSize;
+        if (wsz.X > 0 && wsz.Y > 0)
+            ImGui.GetIO().DisplayFramebufferScale =
+                new Vector2((float)wfb.X / wsz.X, (float)wfb.Y / wsz.Y);
 
         gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
         var fbDef = _window!.FramebufferSize;

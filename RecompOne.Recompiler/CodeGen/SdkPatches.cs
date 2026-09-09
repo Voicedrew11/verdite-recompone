@@ -24,6 +24,10 @@ public static class SdkPatches
             "LoadImage", "StoreImage", "MoveImage", "ClearImage",
             "SetVideoMode", "GetVideoMode"
         }),
+        ("libapi", "RecompOne.Runtime.Sdk.LibApi", new[]
+        {
+            "DMACallback",
+        }),
         ("libcdstream", "RecompOne.Runtime.Sdk.LibCdStream", new[]
         {
             "StSetRing", "StClearRing", "StUnSetRing", "StSetStream",

@@ -9,6 +9,28 @@ namespace RecompOne.Runtime;
 
 public static class Interrupts
 {
+    private static readonly HashSet<string> _reported2 = new();
+
+    private static void ReportOnce(int irq, string kind, string what)
+    {
+        lock (_reported2)
+            if (_reported2.Add($"{irq}:{kind}"))
+                Log.Bios($"IRQ {irq} {what}");
+    }
+
+    /// <summary>
+    /// Address of the game's PSY-Q interrupt-callback table, indexed by irq*4 --
+    /// what libapi's InterruptCallback(irq, func) writes into.
+    ///
+    /// Zero means "derive it from the HookEntryInt argument", which only holds
+    /// for libraries whose interrupt environment matches the offset below. The
+    /// argument is really a jmp_buf, and where the callback table sits relative
+    /// to it is a property of one link of one library version, so a game whose
+    /// layout differs reads unrelated data here. Set this per resident overlay
+    /// when the table has been identified.
+    /// </summary>
+    public static uint CallbackTable;
+
     private static bool _inHandler;
     private static bool _servicing;
 
@@ -103,7 +125,11 @@ public static class Interrupts
     private static void PollSlow(CpuContext cpu, IMemory mem)
     {
         _countdown = PollInterval;
-        TickVBlank();
+        // Only upstream's blocking VSync timeline wants an autonomous vblank
+        // here. On the pin's timeline LibEtc.AdvanceVBlanks delivers IRQ 0 on
+        // its own wall-clock grid, and raising it here as well would deliver
+        // every vblank twice.
+        if (Sdk.LibEtc.BlockingVSync) TickVBlank();
         if (_inHandler || _servicing || !_irqEnabled) return;
 
         var snap = cpu.Snapshot();
@@ -227,15 +253,51 @@ public static class Interrupts
 
         DispatchChains(cpu, mem);
 
+        // 0006. Upstream derives the slot from the HookEntryInt argument alone.
+        // That argument is really a jmp_buf, and where the callback table sits
+        // relative to it is a property of one link of one library version, so a
+        // game whose layout differs reads unrelated data -- for King's Field it
+        // lands in game data and eventually calls a data word. Program.cs
+        // supplies the real per-overlay address; the derived path stays as the
+        // fallback for a game that has not identified one.
         var intrEnv = BiosB.IntrEnvInInterruptAddr;
-        var slot = intrEnv + 2u + (uint)irq * 4u;
-        var handler = intrEnv != 0 ? mem.ReadU32(slot) : 0u;
-        Log.Irq($"irq {irq} env=0x{intrEnv:X8} handler=0x{handler:X8} mask=0x{_imask:X}");
+        uint slot;
+        if (CallbackTable != 0)
+        {
+            slot = CallbackTable + (uint)irq * 4u;
+        }
+        else
+        {
+            if (intrEnv == 0)
+            {
+                ReportOnce(irq, "env", "dropped: no intr env (HookEntryInt never ran)");
+                Ack(irq);
+                return;
+            }
+
+            slot = intrEnv + 2u + (uint)irq * 4u;
+        }
+
+        var handler = mem.ReadU32(slot);
+        Log.Irq($"irq {irq} env=0x{intrEnv:X8} table=0x{CallbackTable:X8} handler=0x{handler:X8} mask=0x{_imask:X}");
         if (handler != 0 && !Callable(handler))
         {
-            Console.WriteLine($"[Interrupts] dropping stale handler 0x{handler:X8} for irq {irq}");
-            mem.WriteU32(slot, 0u);
+            // A table address that is wrong does not read as zero, it reads as
+            // whatever the game keeps there, and calling that jumps into the
+            // middle of nothing. Say which slot it came from, once.
+            ReportOnce(irq, "bogus",
+                $"dropped: handler 0x{handler:X8} at 0x{slot:X8} is not a known " +
+                "function (the callback table address is wrong)");
+            if (CallbackTable == 0) mem.WriteU32(slot, 0u);
             handler = 0u;
+        }
+        else if (handler == 0)
+        {
+            ReportOnce(irq, "empty", $"dropped: no handler at 0x{slot:X8}");
+        }
+        else
+        {
+            ReportOnce(irq, $"deliver:{handler:X8}", $"-> 0x{handler:X8} from 0x{slot:X8}");
         }
 
         if (handler == 0)
@@ -246,7 +308,12 @@ public static class Interrupts
 
         //takes a snap, apparently interrupt callbacks dont operate at the same context? could be wrong in mips3000, need to check furter TODO, seens to be accurate
         var snap = cpu.Snapshot();
-        mem.WriteU16(intrEnv, 1);
+        // The in-interrupt flag lives at the base of the same derived structure,
+        // so it is only known to be that when the structure is what located the
+        // handler. Setting it from a table address would write 1 into an address
+        // nothing identified.
+        var intrFlag = CallbackTable == 0 ? intrEnv : 0u;
+        if (intrFlag != 0) mem.WriteU16(intrFlag, 1);
         var prev = _servicing;
         _servicing = true;
         try
@@ -258,7 +325,7 @@ public static class Interrupts
             _servicing = prev;
         }
 
-        mem.WriteU16(intrEnv, 0);
+        if (intrFlag != 0) mem.WriteU16(intrFlag, 0);
         cpu.Restore(snap);
         if (!_pending[irq]) Ack(irq);
     }

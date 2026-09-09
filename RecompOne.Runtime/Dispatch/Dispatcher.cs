@@ -136,12 +136,15 @@ public static class Dispatcher
 
                     if (s < newEnd && e > newStart)
                     {
-                        if (s >= newStart && e <= newEnd)
-                        {
-                            overwritten ??= [];
-                            overwritten.Add(activeName);
-                        }
-
+                        // Any overlap, not only full containment. OPEN/GAME/END
+                        // all load at the same base and the later executable is
+                        // often smaller, so the contained test would leave the
+                        // previous one's functions resident. The same hole
+                        // shows up when a smaller FDAT module loads over a
+                        // larger one. Upstream still tests `s >= newStart &&
+                        // e <= newEnd` here; that is the bug 0008 fixed.
+                        overwritten ??= [];
+                        overwritten.Add(activeName);
                         continue;
                     }
                 }
@@ -208,6 +211,9 @@ public static class Dispatcher
         Rebuild();
         Runtime.OverlayLog.Record(name, OverlayEventKind.Unloaded);
     }
+
+    /// <summary>Is addr the entry point of a function in a resident overlay?</summary>
+    public static bool HasFunction(uint addr) => _funcMap.ContainsKey(addr);
 
     public static bool CanCall(uint addr)
     {

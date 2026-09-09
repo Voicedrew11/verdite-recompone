@@ -35,6 +35,22 @@ public static class SettingsRegistry
         return _extensions.TryGetValue(sectionId, out var list) ? list : [];
     }
 
+    /// <summary>
+    /// Draw whatever was registered against <paramref name="slotId"/>, from inside
+    /// a section's own body.
+    ///
+    /// <see cref="Extend"/> appends after a section has drawn everything it has,
+    /// which is the right place for a group of its own but the wrong one for an
+    /// option that belongs beside an existing control -- an aspect ratio next to
+    /// the render scale, say. A section that wants to offer that calls this at the
+    /// point it means, with an id of its own (<c>"display.render_scale"</c>), and
+    /// anything registered there draws in line with the section's own widgets.
+    /// </summary>
+    public static void DrawSlot(string slotId)
+    {
+        foreach (var draw in GetExtensions(slotId)) draw();
+    }
+
     public static IReadOnlyList<ISettingsSection> Sections
     {
         get

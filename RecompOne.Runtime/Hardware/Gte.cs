@@ -29,6 +29,20 @@ public static class Gte
     private static short ZSF3, ZSF4;
     private static uint FLAG;
 
+    // What the GTE knows about a projected vertex and then throws away: the view
+    // depth it divided by, and the fraction of a pixel the shift down to SX/SY
+    // truncated. One per screen-coordinate FIFO slot, shifted with SX and SY, so a
+    // read of SXY0/1/2 can hand out the numbers that belong to *that* slot.
+    // 0009-0012; upstream has no equivalent -- PGXP answers the same question from
+    // the other side, through the CPU's registers rather than by address.
+    private struct Projected
+    {
+        public float Z, Fx, Fy;
+        public bool Clipped, Valid;
+    }
+
+    private static readonly Projected[] SP = new Projected[3];
+
     private const int SnapshotSlots = 8192;
     
     private static readonly short[] _snapRt = new short[SnapshotSlots * 9];
@@ -319,8 +333,10 @@ public static class Gte
         MAC0 = (int)sx;
         var sy = CheckMac0((long)div * IR2 + OFY);
         MAC0 = (int)sy;
-        var nx = SatX((int)(sx >> 16));
-        var ny = SatY((int)(sy >> 16));
+        var rx = (int)(sx >> 16);
+        var ry = (int)(sy >> 16);
+        var nx = SatX(rx);
+        var ny = SatY(ry);
         SX[0] = SX[1];
         SX[1] = SX[2];
         SX[2] = (short)nx;
@@ -328,7 +344,47 @@ public static class Gte
         SY[1] = SY[2];
         SY[2] = (short)ny;
 
+        // PGXP takes the same moment from the other side: not the truncated packet
+        // coordinate and the fraction it lost, but the 16.16 projection recomputed
+        // in floating point off the un-truncated view depth. The two mechanisms sit
+        // side by side here on purpose -- one switch downstream decides which of
+        // them DrawPolygon asks.
         if (Pgxp.Pgxp.Enabled) PushPrecise(m3, nx, ny);
+
+        // The depth and the truncated fraction travel with the coordinate, in the
+        // same FIFO, so that whichever slot the game stores later carries its own
+        // numbers rather than the newest ones. sx and sy are 16.16 and the shift
+        // above floors them, so trueX - nx is exactly what SX2 lost -- and it is
+        // only meaningful when the coordinate did not clamp.
+        SP[0] = SP[1]; SP[1] = SP[2];
+        var clipped = rx != nx || ry != ny;
+        SP[2] = new Projected
+        {
+            Z = sz,
+            Fx = clipped ? 0f : (sx & 0xFFFF) * (1f / 65536f),
+            Fy = clipped ? 0f : (sy & 0xFFFF) * (1f / 65536f),
+            Clipped = clipped,
+            Valid = sz > 0,
+        };
+
+        // The one place the screen position, the depth that made it and the true
+        // 16.16 coordinate are all in hand. GteDepth keys on the (possibly
+        // clamped) packet position because that is what survives into the GP0
+        // packet. A saturated vertex is recorded for its depth so the polygon
+        // can stay perspective-correct, but it is not moved off the clamp wall
+        // — that opened holes along shared edges. Several vertices can share a
+        // clamped key; Apply picks a depth per primitive and a fraction per key.
+        //
+        // sx and sy are 16.16 and the shift above floors them, so trueX - nx is
+        // the fraction SX2 lost when the coordinate did not clamp.
+        if (GteDepth.Active)
+        {
+            // The probes measure what the GTE projected, not what either mechanism
+            // chose to keep, so this is counted whichever of the two is answering.
+            GteDepth.NoteProjected(SP[2].Fx, SP[2].Fy, clipped, sz > 0);
+            if (GteDepth.PositionFallback)
+                GteDepth.Record(nx, ny, sz, sx * (1f / 65536f), sy * (1f / 65536f), clipped);
+        }
 
         if (last)
         {
@@ -696,9 +752,29 @@ public static class Gte
         MatVec(mat, t0, t1, t2, vx, vy, vz, sf, lm);
     }
 
+    // A screen coordinate can only leave the GTE through one of these registers, and
+    // it leaves as a whole word, so this is the one place an address-keyed map can
+    // pick the attributes up. Both `swc2 $14, off(base)` (which is StoreWord, and so
+    // comes through here) and `mfc2 rt, $14` are covered: the value is offered to the
+    // store that copies it, and GteVertexMap ties it to the address it lands at.
+    // w is the view depth the divide actually used, in GTE units, floored at H/2 the
+    // way the hardware's divider is: below that the projection is meaningless and a
+    // W of nearly zero detonates the perspective divide downstream.
+    private static void PublishSxy(int reg, uint value)
+    {
+        ref readonly var p = ref SP[reg == 15 ? 2 : reg - 12];
+        if (!p.Valid) return;
+        GteVertexMap.Publish(value, p.Z, p.Fx, p.Fy, p.Clipped);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static uint Read(int reg)
     {
+        if (GteVertexMap.Active && (uint)(reg - 12) <= 3u)
+            PublishSxy(reg, reg == 12 ? (uint)((ushort)SX[0] | (SY[0] << 16))
+                         : reg == 13 ? (uint)((ushort)SX[1] | (SY[1] << 16))
+                                     : (uint)((ushort)SX[2] | (SY[2] << 16)));
+
         switch (reg)
         {
             case 0: return (uint)((ushort)V[0] | (V[1] << 16));
@@ -772,17 +848,25 @@ public static class Gte
             case 9: IR1 = (short)val; break;
             case 10: IR2 = (short)val; break;
             case 11: IR3 = (short)val; break;
+            // A coordinate the game loads back in is not one this GTE projected --
+            // NormalClip hands all three vertices of a polygon back for the cross
+            // product -- so the slot's depth and fraction stop being about it. They
+            // are dropped rather than left to be published against a value that
+            // happens to match.
             case 12:
                 SX[0] = (short)val;
                 SY[0] = (short)(val >> 16);
+                SP[0] = default;
                 break;
             case 13:
                 SX[1] = (short)val;
                 SY[1] = (short)(val >> 16);
+                SP[1] = default;
                 break;
             case 14:
                 SX[2] = (short)val;
                 SY[2] = (short)(val >> 16);
+                SP[2] = default;
                 break;
             case 15:
                 SX[0] = SX[1];
@@ -791,6 +875,9 @@ public static class Gte
                 SY[1] = SY[2];
                 SX[2] = (short)val;
                 SY[2] = (short)(val >> 16);
+                SP[0] = SP[1];
+                SP[1] = SP[2];
+                SP[2] = default;
                 break;
             case 16: SZ[0] = (ushort)val; break;
             case 17: SZ[1] = (ushort)val; break;
@@ -863,8 +950,10 @@ public static class Gte
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void WriteControl(int reg, uint val)
     {
+        // The rotation matrix, the translation and the screen offsets are what a
+        // transform serial identifies; anything else leaves it alone.
         if (reg <= 7 || reg is 24 or 25 or 26) _snapDirty = true;
-        
+
         switch (reg)
         {
             case 0:

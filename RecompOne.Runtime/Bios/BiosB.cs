@@ -265,9 +265,30 @@ public static class BiosB
         return e.Buttons;
     }
 
+    // How often B(16h) PAD_dr may pump the host for fresh input, in
+    // milliseconds. A game polling the pad in a tight loop calls this hundreds
+    // of thousands of times a second, and pumping on every call would cost far
+    // more than the loop it is unblocking; a VBlank is 16 ms, so this is still
+    // fresher than hardware.
+    private const double PadPumpIntervalMs = 4.0;
+
     private static void PadRead(IMemory m)
     {
         if (_padBuf == 0) return;
+
+        // On hardware the BIOS fills the pad buffer from its VBlank interrupt,
+        // so PAD_dr reports the buttons as they are now whether or not the game
+        // ever calls VSync. Here the host is only polled inside PresentFrame,
+        // which only runs from VSync -- so a game that waits on the pad without
+        // vsyncing reads one frozen snapshot forever and the port deadlocks.
+        //
+        // King's Field does exactly that: every screen change begins with
+        // `do { } while (PadRead(1) != 0)`, waiting for all buttons to come up,
+        // and it draws nothing while it waits. Pressing the button that opens
+        // the menu hung the game on the release that could never arrive -- no
+        // error, no frames, just the last image on screen.
+        Host.HostWindow.PumpInput(PadPumpIntervalMs);
+
         var s = Hardware.Controller.State;
         var swapped = (ushort)((s >> 8) | (s << 8));
         var s2 = Hardware.Controller.State2;

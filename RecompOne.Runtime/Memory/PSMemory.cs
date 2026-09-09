@@ -57,8 +57,14 @@ public sealed class PSMemory : IMemory
         _ram = new byte[size];
         _ramMask = size - 1u;
         _frozen = new bool[size];
-        
+
         Runtime.RamSize = size;
+
+        // PGXP shadows one PgxpValue per RAM word, so it has to be sized from the
+        // same array the guest sees -- which is a ctor argument rather than a
+        // fixed 2 MB. A stale entry cannot lie: every lookup checks the word it
+        // stored against the word the GPU is drawing, so a DMA or BIOS write that
+        // PGXP never saw is refused rather than believed.
         Pgxp.PgxpMemory.Init(size);
 
         _dma = new Dma(this, _gpu, _spu, _mdec, () => Runtime.DispatchIrq(3));
@@ -130,9 +136,26 @@ public sealed class PSMemory : IMemory
 
     private readonly Sio0 _sio = new();
 
+    // Diagnostic: name the recompiled functions that drive the CD controller.
+    // PSY-Q reaches I/O through a base pointer held in a global rather than a
+    // literal lui 0x1F80, so the library cannot be identified by scanning for
+    // hardware addresses statically. Catching the access here and printing the
+    // managed stack names the calling function directly. Off unless KF2_CDTRACE=1.
+    private static readonly HashSet<uint> CdTraced = new();
+    private static readonly bool CdTraceOn =
+        Environment.GetEnvironmentVariable("KF2_CDTRACE") == "1";
+
     private static bool IsCd(uint phys)
     {
-        return phys >= 0x1F801800u && phys <= 0x1F801803u;
+        var hit = phys >= 0x1F801800u && phys <= 0x1F801803u;
+        if (hit && CdTraceOn)
+            lock (CdTraced)
+            {
+                if (CdTraced.Add(phys))
+                    Console.WriteLine($"[CDTRACE] first access 0x{phys:X8}\n{Environment.StackTrace}");
+            }
+
+        return hit;
     }
 
     private static bool IsSpu(uint phys)
@@ -321,7 +344,14 @@ public sealed class PSMemory : IMemory
         if (IsSpu(phys)) return (uint)(_spu.ReadReg16(phys) | (_spu.ReadReg16(phys + 2) << 16));
         if (Timers.InRange(phys) && _timers.TryRead(phys, out var tv)) return tv;
         var s = Resolve(address, 4);
-        return (uint)(s[0] | (s[1] << 8) | (s[2] << 16) | (s[3] << 24));
+        uint word = (uint)(s[0] | (s[1] << 8) | (s[2] << 16) | (s[3] << 24));
+        // A word carrying a projected screen coordinate is offered to whichever store
+        // copies it next, which is how a vertex's depth follows the game's lw/sw out
+        // of its transform cache and into the primitive packet. Off entirely unless
+        // perspective correction or sub-pixel positioning is on, and then it is one
+        // bit of a presence bitmap.
+        if (GteVertexMap.Active && phys < MemoryMap.RamWindow) GteVertexMap.NoteRead(phys, word);
+        return word;
     }
 
     private void WriteU8Slow(uint address, byte value)
@@ -491,6 +521,10 @@ public sealed class PSMemory : IMemory
 
         if (_timers.TryWrite(phys, value)) return;
         var s = Resolve(address, 4);
+        // The other half of the association: a store carrying a value the GTE (or an
+        // earlier load) published binds the destination address to that vertex, and a
+        // store carrying anything else drops whatever the destination used to mean.
+        if (GteVertexMap.Active && phys < MemoryMap.RamWindow) GteVertexMap.NoteWrite(phys, value);
         if (_frozenCount > 0 && phys < MemoryMap.RamWindow)
         {
             var b = phys & _ramMask;

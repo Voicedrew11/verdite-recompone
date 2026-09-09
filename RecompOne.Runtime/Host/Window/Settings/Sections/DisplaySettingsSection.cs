@@ -50,6 +50,11 @@ internal sealed class DisplaySettingsSection : ISettingsSection
         if (scale != Hle.GlVram.Scale)
             ImGui.TextDisabled(Localization.T("settings.display.restart_pending"));
 
+        // How big the picture is drawn, and how wide it is presented, are the same
+        // kind of choice, so a port offering an aspect ratio has somewhere to put it
+        // that is not a group appended below the whole section.
+        SettingsRegistry.DrawSlot("display.render_scale");
+
         ImGui.Separator();
 
         var index = Array.IndexOf(Backends, ConfigManager.View.GpuBackend);

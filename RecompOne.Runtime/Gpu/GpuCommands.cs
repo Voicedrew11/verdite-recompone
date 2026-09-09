@@ -124,6 +124,7 @@ public sealed partial class Gpu
             }
 
         Assets.Textures.VramTracker.MarkCpuWrite(x, y, w, h);
+        ClearZ(x, y, w, h);
 
         if (HleOn) HleFill(x, y, w, h, color);
     }
@@ -167,7 +168,7 @@ public sealed partial class Gpu
         _loadPx = 0;
         _loadImage = true;
         HleLoadBegin();
-        _fifoCount = 0;
+        ClearFifo();
     }
 
     private void StoreImageHalfword(ushort value)

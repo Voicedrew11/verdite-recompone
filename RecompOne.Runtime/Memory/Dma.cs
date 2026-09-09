@@ -93,7 +93,11 @@ public sealed class Dma
                 var header = _mem.ReadU32(addr);
                 var count = header >> 24;
                 for (uint i = 0; i < count; i++)
-                    _gpu.WriteGp0(_mem.ReadU32(addr + 4u + i * 4u));
+                {
+                    var src = addr + 4u + i * 4u;
+                    _gpu.WriteGp0(_mem.ReadU32(src), src);
+                }
+
                 var next = header & 0xFFFFFFu;
                 if (next == 0xFFFFFFu || (next & 0x800000u) != 0) break;
                 addr = next & Runtime.RamWordMask;
@@ -103,7 +107,10 @@ public sealed class Dma
         {
             var words = WordCount(bcr);
             for (uint i = 0; i < words; i++)
-                _gpu.WriteGp0(_mem.ReadU32(madr + i * 4u));
+            {
+                uint src = madr + i * 4u;
+                _gpu.WriteGp0(_mem.ReadU32(src), src);
+            }
         }
         else
         {
@@ -145,6 +152,12 @@ public sealed class Dma
 
     private void Complete(int channel)
     {
+        // 0004. Not gated on DICR: the library routine that would have set those
+        // bits is the same one LibApi reimplements, so it never runs to set them.
+        // A callback exists only because the game asked for it, which is the same
+        // condition the enable bits encode.
+        Sdk.LibApi.Complete(channel);
+
         Log.Irq($"dma ch {channel} dicr = 0x{_dicr:X8}");
         var master = (_dicr & (1u << 23)) != 0;
         var enabled = (_dicr & (1u << (16 + channel))) != 0;

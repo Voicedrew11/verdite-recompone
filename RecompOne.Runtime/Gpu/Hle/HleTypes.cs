@@ -7,6 +7,13 @@ public struct HleVertex
     public byte R, G, B;
     public float U, V;
     public bool HasGteZ;
+    // Independent of HasGteZ: the depth buffer wants Z on untextured geometry
+    // too, and putting that Z into clip W would turn perspective correction on
+    // as a side effect. HasPersp is the original "use Z as gl_Position.w".
+    public bool HasPersp;
+    // Upstream's own pair, for PGXP and the frame interpolator. They sit beside
+    // ours rather than replacing it: HasGteZ/HasPersp answer for the address-map
+    // source, Depth/Transform for PGXP's.
     public float Depth;
     public int Transform;
 }

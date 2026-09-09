@@ -71,8 +71,37 @@ public abstract class Popup
         var viewport = ImGui.GetMainViewport();
         var style = ImGui.GetStyle();
 
+        // A popup is centred and pinned every frame, and SetNextWindowPos is what
+        // sets ImGui's window_pos_set_by_api -- which is the flag that suppresses
+        // ImGui's own clamp of a window into its viewport. Nothing below gives the
+        // size back either: the flags are NoResize, NoMove, NoScrollbar and
+        // NoScrollWithMouse. So a popup larger than the window overflows
+        // symmetrically off all four edges, and what left cannot be reached at
+        // all -- including, in the settings popup, the UI-scale field that is the
+        // one control that would undo it.
+        //
+        // Size is in logical units and Theme.Scale is DpiScale * UiScale, so the
+        // settings popup (780x500) outgrows a 1280x720 window at scale 1.44. That
+        // is inside UiScale's own range (0.5-3), and a DpiScale misread from a
+        // fractionally scaled monitor -- GLFW's Wayland path reports the integer
+        // wl_output scale, so 1.15 arrives as 2 -- reaches it on its own at a
+        // UiScale of 1, with no way back short of editing interface.ini by hand.
+        //
+        // Clamping the size to the viewport is what makes that impossible rather
+        // than unlikely: a scale too large for the window now costs scrolling
+        // instead of costing the controls. The ##body child scrolls by default
+        // (the NoScrollbar flags are this window's, not its), so a fixed-height
+        // popup that had to be cut short stays whole. An auto-height one
+        // (Size.Y == 0) keeps its height ImGui's to pick and is given the same
+        // ceiling as a constraint, here and again on the child, which is what
+        // turns its overflow into scrolling rather than into clipping.
+        var room = viewport.WorkSize - style.WindowPadding * 2f;
+        var size = Vector2.Min(Size * Theme.Scale, room);
+        if (Size.Y <= 0f) size.Y = 0f;
+
         ImGui.SetNextWindowPos(viewport.GetCenter(), ImGuiCond.Always, new Vector2(0.5f, 0.5f));
-        ImGui.SetNextWindowSize(Size * Theme.Scale, ImGuiCond.Always);
+        ImGui.SetNextWindowSize(size, ImGuiCond.Always);
+        if (Size.Y <= 0f) ImGui.SetNextWindowSizeConstraints(Vector2.Zero, room);
 
         const ImGuiWindowFlags flags =
             ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove |
@@ -97,6 +126,16 @@ public abstract class Popup
         var body = new Vector2(0f, Size.Y > 0f ? -padding.Y : 0f);
         var childFlags = ImGuiChildFlags.AlwaysUseWindowPadding |
                          (Size.Y > 0f ? ImGuiChildFlags.None : ImGuiChildFlags.AutoResizeY);
+
+        // An AutoResizeY child sizes itself to its content, which is how the
+        // auto-height popups get their height at all -- so left alone it grows
+        // straight past a window that has just been clamped, and the overflow is
+        // clipped silently rather than scrolled. A max constraint is how ImGui
+        // caps an auto-resizing child; below the cap nothing changes, and at it
+        // the child scrolls.
+        if (Size.Y <= 0f)
+            ImGui.SetNextWindowSizeConstraints(Vector2.Zero,
+                new Vector2(float.MaxValue, room.Y - Theme.TitleBarHeight - padding.Y * 2f));
 
         ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, padding);
         ImGui.PushStyleVar(ImGuiStyleVar.ChildBorderSize, 0f);

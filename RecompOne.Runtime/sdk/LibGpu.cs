@@ -15,6 +15,8 @@ public static class LibGpu
         var gpu = Runtime.Gpu;
         if (gpu == null) return;
 
+        if (Log.SdkOn) Log.Sdk($"DrawOTag ot=0x{c.A0:X8}");
+
         var addr = c.A0 & Runtime.RamWordMask;
         var custom = GpuPrims.Any && GpuPrims.OtLength > 0;
         var otBase = GpuPrims.OtBase & Runtime.RamWordMask;
@@ -22,6 +24,12 @@ public static class LibGpu
 
         for (var guard = 0; guard < 0x100000; guard++)
         {
+            // Where in the table this primitive was linked, counted from the head —
+            // which is the far end, since the walk goes back to front. It is the
+            // game's own opinion of the primitive's depth, and the only thing that
+            // can contradict a recovered SZ. See GteDepth.OtEntry.
+            GteDepth.OtEntry = guard;
+
             if (custom && addr >= otBase && addr < otEnd)
                 gpu.EmitCustomOrder((int)((addr - otBase) >> 2));
 
@@ -31,10 +39,19 @@ public static class LibGpu
             if (count > 0)
             {
                 if (m is PSMemory ram && ram.TryWords(addr + 4u, count, out var words))
+                {
                     gpu.WriteGp0Packet(words, addr + 4u);
+                }
                 else
+                {
+                    // 0012. The slow path has to carry the source address too, or
+                    // every vertex in a packet that took it misses the map.
                     for (var i = 0; i < count; i++)
-                        gpu.WriteGp0(m.ReadU32(addr + 4u + (uint)i * 4u));
+                    {
+                        var src = addr + 4u + (uint)i * 4u;
+                        gpu.WriteGp0(m.ReadU32(src), src);
+                    }
+                }
             }
 
             var next = header & 0xFFFFFFu;
@@ -42,11 +59,17 @@ public static class LibGpu
             addr = next & Runtime.RamWordMask;
         }
 
+        // The length is only known once the walk ends, so it is published for the
+        // next one. An entry is readable as an OTZ against it: the walk starts at
+        // the far end, so otz = length - 1 - entry.
+        if (GteDepth.OtEntry >= 0) GteDepth.OtLength = GteDepth.OtEntry + 1;
+        GteDepth.OtEntry = -1;
         if (custom) GpuPrims.Clear();
     }
 
     public static void DrawSync(CpuContext c, IMemory m)
     {
+        if (Log.SdkOn) Log.Sdk($"DrawSync({(int)c.A0})");
         c.V0 = 0;
     }
 
@@ -70,6 +93,10 @@ public static class LibGpu
         var dfe = m.ReadU8(env + 0x17);
         var isbg = m.ReadU8(env + 0x18);
         byte r0 = m.ReadU8(env + 0x19), g0 = m.ReadU8(env + 0x1A), b0 = m.ReadU8(env + 0x1B);
+
+        if (Log.SdkOn)
+            Log.Sdk($"PutDrawEnv env=0x{env:X8} clip=({clipX},{clipY})-{clipW}x{clipH} " +
+                    $"ofs=({ofsX},{ofsY}) tpage=0x{tpage:X4} isbg={isbg}");
 
         _curCs = GetCs(clipX, clipY);
         _curCe = GetCe((short)(clipX + clipW - 1), (short)(clipY + clipH - 1));
@@ -157,7 +184,11 @@ public static class LibGpu
         var isinter = m.ReadU8(env + 0x10);
         var isrgb24 = m.ReadU8(env + 0x11);
         var pal = Pal;
-        
+
+        if (Log.SdkOn)
+            Log.Sdk($"PutDispEnv env=0x{env:X8} disp=({dispX},{dispY})-{dispW}x{dispH} " +
+                    $"screen=({scrX},{scrY})-{scrW}x{scrH} inter={isinter} rgb24={isrgb24}");
+
         gpu.WriteGp1(0x05000000u | (((uint)dispY & 0x3FF) << 10) | ((uint)dispX & 0x3FF));
 
         var hStart = scrX * 10 + 0x260;

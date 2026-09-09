@@ -50,6 +50,21 @@ public static class Runtime
 
     public static Config.ViewConfig View => Config.ConfigManager.View;
 
+    //0025. The host frame throttle's target, in frames a second; 0 turns it off.
+    //Exposed here because FrameClock is internal to the runtime and a port's
+    //pacing lives outside it. See FrameClock.TargetFps for what this does and
+    //does not pace.
+    public static double TargetFps
+    {
+        get => Host.FrameClock.TargetFps;
+        set => Host.FrameClock.TargetFps = value;
+    }
+
+    public static void ResyncFrameClock()
+    {
+        Host.FrameClock.Resync();
+    }
+
     private static readonly List<Action<Config.ViewConfig>> _defaults = [];
 
     public static void Defaults(Action<Config.ViewConfig> apply)
@@ -106,6 +121,23 @@ public static class Runtime
     {
         HostWindow.WaitForValidDisc();
     }
+
+    /// <summary>
+    /// Take in host events and draw one frame, from outside the game's own frame
+    /// loop.
+    ///
+    /// WaitForValidDisc already runs exactly this loop, but only ever for its own
+    /// condition, so anything else that has to keep the window alive while it
+    /// works had nothing to call. A port that must build its game assembly before
+    /// there is a game to run is the case: the work is seconds long, it happens
+    /// after Initialize and before the first frame, and a window that stops
+    /// pumping for that long is a hung window as far as the desktop is concerned.
+    ///
+    /// HostWindow.Pump is internal and this is the same call, so a caller drives
+    /// its own loop and owns its own progress UI -- Popup and PopupManager.Register
+    /// are already public, so that UI needs nothing further from here.
+    /// </summary>
+    public static void Pump() => HostWindow.Pump();
 
     public static string Title
     {
@@ -177,6 +209,7 @@ public static class Runtime
         Sdk.LibCdStream.Reset();
         Assets.Xa.XaRouter.Reset();
         Sdk.LibPad.Reset();
+        Sdk.LibApi.Reset();
         Dispatch.Dispatcher.Reset();
         Bios.BiosB.Reset();
         OverlayLog.Clear();
@@ -317,7 +350,11 @@ public static class Runtime
             Sdk.LibPad.Refresh(Mem);
         } //is this correct?
 
-        Interrupts.Raise(0);
+        // Only on upstream's blocking timeline. On the pin's, LibEtc.TickVBlank
+        // delivers IRQ 0 on its own wall-clock grid and a present is not a
+        // vblank -- raising it here as well would deliver every vblank twice,
+        // at the render rate rather than at 60 Hz.
+        if (Sdk.LibEtc.BlockingVSync) Interrupts.Raise(0);
     }
 
     public static void DispatchIrq(int irq)

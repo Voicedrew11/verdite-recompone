@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using RecompOne.Runtime.Context;
 using RecompOne.Runtime.Events;
+using RecompOne.Runtime.Hardware;
 using RecompOne.Runtime.Memory;
 
 namespace RecompOne.Runtime.Sdk;
@@ -8,6 +10,41 @@ public static class LibEtc
 {
     private static int _vcount;
     private static readonly VSyncEvent _vsyncEvent = new();
+
+    /// <summary>
+    /// Which of the two vblank timelines VSync runs on.
+    ///
+    /// Upstream grew its own after the pin: Interrupts owns a wall-clock grid and
+    /// VSync *blocks* in WaitVBlanks until the count reaches its target, which is
+    /// what the hardware does and is also a hard 60 Hz ceiling on every VSync
+    /// call. This port cannot have that ceiling -- FramePacing hands FrameClock a
+    /// deliberately permissive rate and keeps its own deadline at DrawOTag, and
+    /// MenuPacing, LoadPacing and SpriteAnim are all measured against a VSync that
+    /// returns immediately. So 0021's non-blocking grid stays the default and
+    /// upstream's is here beside it, to be compared rather than replaced.
+    ///
+    /// KF2_VSYNC=block is the console switch.
+    /// </summary>
+    public static bool BlockingVSync;
+
+    //The vblank is time, not a call. On hardware the interrupt fires every 16.7 ms
+    //whether or not the game is ready for it: a loop blocked on a CD read misses
+    //pictures, not vblanks. This port advanced _vcount once per VSync call instead,
+    //so every game-side clock hung on the vblank -- the music sequencer among them --
+    //ran at the rendered frame rate: half speed on the CD-bound title screen (one
+    //VSync call per ~15 fps picture), half again at KF2_FPS=15 (two calls per 66 ms
+    //frame). Advance on a wall-clock grid and deliver the vblanks missed since the
+    //last call as a burst, which is what the hardware's interrupt would have done
+    //across the same gap.
+    private static readonly Stopwatch VBlankClock = Stopwatch.StartNew();
+    private static double _nextVBlankMs;
+    private static bool _timelineStarted;
+
+    private const double VBlankMs = 1000.0 / 60.0;
+
+    //A host stall longer than this (window drag, breakpoint) resyncs the grid
+    //instead of fast-forwarding the game through the whole gap.
+    private const int MaxCatchUpVBlanks = 120;
 
     private static double HblankHz => LibGpu.Pal ? 15625.0 : 15734.0; //correct?
 
@@ -18,25 +55,89 @@ public static class LibEtc
     {
         var mode = (int)c.A0;
         Log.Sdk($"VSync({mode})");
+
         if (mode < 0)
         {
-            c.V0 = (uint)Interrupts.VBlankCount;
+            c.V0 = BlockingVSync ? (uint)Interrupts.VBlankCount : (uint)_vcount;
             return;
         }
 
         if (mode == 1)
         {
-            c.V0 = Elapsed();
+            //The pin returned 0 here and the port's measurements were taken
+            //against that, so only the blocking timeline reports real hblanks.
+            c.V0 = BlockingVSync ? Elapsed() : 0;
             return;
         }
 
+        //Upstream's frame interpolator feeds off this whichever timeline runs; it
+        //is inert unless Interp is enabled.
         Interp.VideoRate.Push(mode == 0 ? 1 : mode);
+
         Runtime.PresentFrame();
-        WaitVBlanks(c, m, mode == 0 ? 1 : mode);
-        var elapsed = Elapsed();
-        _lastVSyncCount = Interrupts.VBlankCount;
-        _lastVSyncMs = Interrupts.ClockMs;
+
+        if (BlockingVSync)
+        {
+            WaitVBlanks(c, m, mode == 0 ? 1 : mode);
+            var elapsed = Elapsed();
+            _lastVSyncCount = Interrupts.VBlankCount;
+            _lastVSyncMs = Interrupts.ClockMs;
+            _vcount++;
+
+            if (Event.HasAnyListeners<VSyncEvent>())
+            {
+                var e = _vsyncEvent;
+                e.Context = c;
+                e.Memory = m;
+                e.Frame = _vcount;
+                Event.Dispatch(e);
+            }
+
+            c.V0 = elapsed;
+            return;
+        }
+
+        AdvanceVBlanks(c, m);
+        c.V0 = 0;
+    }
+
+    private static void AdvanceVBlanks(CpuContext c, IMemory m)
+    {
+        var now = VBlankClock.Elapsed.TotalMilliseconds;
+        if (!_timelineStarted)
+        {
+            _timelineStarted = true;
+            _nextVBlankMs = now;
+        }
+        else if (now - _nextVBlankMs > MaxCatchUpVBlanks * VBlankMs)
+        {
+            // The host was stopped, so discard its stale vblanks; retain only
+            // the current boundary below rather than fast-forwarding the game.
+            _nextVBlankMs = now;
+        }
+
+        var n = 0;
+        while (_nextVBlankMs <= now && n < MaxCatchUpVBlanks)
+        {
+            _nextVBlankMs += VBlankMs;
+            n++;
+            TickVBlank(c, m);
+        }
+
+        //The loop cap is the same size as the resync threshold, so it only bites at
+        //the exact boundary; if it ever does, snap the grid to now rather than carry
+        //the leftover gap into the next call and lag a frame behind for good.
+        if (n == MaxCatchUpVBlanks && _nextVBlankMs < now) _nextVBlankMs = now;
+    }
+
+    private static void TickVBlank(CpuContext c, IMemory m)
+    {
         _vcount++;
+
+        //RCntCNT3/EvSpINT -- the vblank root counter. a game that opened it with
+        //EvMdINTR expects its handler once a frame; the recompiled build has no
+        //timer interrupt, so this is the only place it can come from.
+        Bios.BiosB.DeliverEventIntr(c, m, 0xF2000003u, 0x0002u);
 
         if (Event.HasAnyListeners<VSyncEvent>())
         {
@@ -47,7 +148,9 @@ public static class LibEtc
             Event.Dispatch(e);
         }
 
-        c.V0 = elapsed;
+        //The PSY-Q vblank callback (IRQ 0) belongs to the vblank too, not to the
+        //VSync call -- the game's own frame counter hangs off it.
+        Runtime.DispatchIrq(0);
     }
 
     private static uint Elapsed()
@@ -62,8 +165,6 @@ public static class LibEtc
         var target = _lastVSyncCount + count;
         var floor = Interrupts.VBlankCount + 1;
         if (target < floor) target = floor;
-
-        var began = Interrupts.ClockMs;
 
         while (Interrupts.VBlankCount < target)
         {
@@ -80,9 +181,5 @@ public static class LibEtc
 
             Interrupts.PollNow(c, m);
         }
-
-        var waited = Interrupts.ClockMs - began;
-
-        var extra = Interrupts.VBlankCount - target;
     }
 }

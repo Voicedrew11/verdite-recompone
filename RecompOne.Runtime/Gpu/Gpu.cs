@@ -36,6 +36,14 @@ public sealed partial class Gpu
     private int _dmaDir;
 
     private readonly uint[] _fifo = new uint[1024];
+
+    // 0012. The guest address each word of the command was read out of, word for
+    // word alongside _fifo, or 0 for a word written straight to GP0 that never
+    // lived in memory. A vertex's depth is keyed on that address, so this is what
+    // reunites a packet coordinate with the GTE call that produced it. Upstream's
+    // _fifoBase below is the same idea at packet granularity; this is per word,
+    // which is what a DrawOTag walk needs.
+    private readonly uint[] _fifoSrc = new uint[1024];
     private int _fifoCount;
     private uint _fifoBase;
     private int _need;
@@ -123,10 +131,18 @@ public sealed partial class Gpu
 
     private bool _polylineShaded;
 
-    private void Push(uint word)
+    private void Push(uint word, uint srcAddr = 0u)
     {
         if (_fifoCount == 0) _fifoBase = 0u;
-        if (_fifoCount < _fifo.Length) _fifo[_fifoCount++] = word;
+        if (_fifoCount >= _fifo.Length) return;
+        _fifoSrc[_fifoCount] = srcAddr;
+        _fifo[_fifoCount++] = word;
+    }
+
+    private void ClearFifo()
+    {
+        _fifoCount = 0;
+        _fifoBase = 0u;
     }
 
     public uint FifoBase => _fifoBase;
@@ -139,18 +155,24 @@ public sealed partial class Gpu
 
         if (_loadImage || _polyline || _fifoCount != 0 || words.Length > _fifo.Length)
         {
-            foreach (var w in words) WriteGp0(w);
+            for (var i = 0; i < words.Length; i++)
+                WriteGp0(words[i], baseAddress == 0u ? 0u : baseAddress + (uint)i * 4u);
             return;
         }
 
         var need = CommandLength(words[0]);
         if (need != words.Length)
         {
-            foreach (var w in words) WriteGp0(w);
+            for (var i = 0; i < words.Length; i++)
+                WriteGp0(words[i], baseAddress == 0u ? 0u : baseAddress + (uint)i * 4u);
             return;
         }
 
         words.CopyTo(_fifo);
+        // 0012 needs the per-word address here too, or a packet taken by this
+        // fast path arrives with no source and every vertex in it misses.
+        for (var i = 0; i < words.Length; i++)
+            _fifoSrc[i] = baseAddress == 0u ? 0u : baseAddress + (uint)i * 4u;
         _fifoCount = words.Length;
         _fifoBase = baseAddress;
         Execute();
@@ -158,6 +180,14 @@ public sealed partial class Gpu
     }
 
     public void WriteGp0(uint word)
+    {
+        WriteGp0(word, 0u);
+    }
+
+    /// <summary><paramref name="srcAddr"/> is the guest address the word came from --
+    /// DrawOTag and the DMA both read the command stream out of memory -- or 0 when
+    /// it was written to the register directly and has no address.</summary>
+    public void WriteGp0(uint word, uint srcAddr)
     {
         if (_loadImage)
         {
@@ -176,17 +206,17 @@ public sealed partial class Gpu
             {
                 _polyline = false;
                 ExecutePolyline();
-                _fifoCount = 0;
+                ClearFifo();
             }
             else
             {
-                Push(word);
+                Push(word, srcAddr);
             }
 
             return;
         }
 
-        Push(word);
+        Push(word, srcAddr);
         if (_fifoCount == 1)
         {
             _need = CommandLength(word);
@@ -203,14 +233,19 @@ public sealed partial class Gpu
         if (_fifoCount >= _need)
         {
             Execute();
-            if (!_loadImage) _fifoCount = 0;
+            if (!_loadImage) ClearFifo();
         }
     }
+
 
     public void WriteGp1(uint word)
     {
         var op = (word >> 24) & 0xFF;
         var p = word & 0xFFFFFF;
+        // 0003. GP1 is display/control only -- a handful of writes per mode change
+        // -- so tracing all of it is cheap and it is the only way to see whether
+        // the game ever enabled the display (GP1(03)).
+        if (Log.GpuOn) Log.Gpu($"GP1({op:X2}) 0x{p:X6}");
         switch (op)
         {
             case >= 0x05 and <= 0x08:
@@ -219,7 +254,7 @@ public sealed partial class Gpu
                 return;
             case 0x00: Reset(); break;
             case 0x01:
-                _fifoCount = 0;
+                ClearFifo();
                 _polyline = false;
                 _loadImage = false;
                 break;
@@ -259,7 +294,7 @@ public sealed partial class Gpu
 
     private void Reset()
     {
-        _fifoCount = 0;
+        ClearFifo();
         _polyline = _loadImage = _readImage = false;
         _displayDisabled = true;
         _dmaDir = 0;

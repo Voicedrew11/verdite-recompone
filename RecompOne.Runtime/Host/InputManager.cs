@@ -94,6 +94,68 @@ internal static unsafe class InputManager
         return _keyboard?.IsKeyPressed(k) ?? false;
     }
 
+    // ---- the mouse, as a motion source rather than a pointer -----------------
+    //
+    // A pointer runs out of desktop halfway through a turn, so a game played with
+    // the mouse needs the lock: GLFW's disabled cursor reports an unbounded
+    // virtual position, and the difference between two of them is the motion
+    // itself. Raw mode is the same thing with the desktop's pointer acceleration
+    // taken out, which is what a look axis wants, so it is preferred where the
+    // platform has it.
+    //
+    // The accumulator runs whether or not anything has asked for capture -- it is
+    // one subtraction per callback -- and is cleared on the mode change, because
+    // the pointer teleports when the cursor is locked or let go and that jump is
+    // not motion anyone asked for.
+    static Vector2 _mousePos;
+    static bool _mouseSeen;
+    static float _mouseDx, _mouseDy;
+    static bool _mouseCaptured;
+
+    public static bool MouseAvailable => _mouse != null;
+
+    /// <summary>
+    /// Lock the pointer to the window and hide it, or give it back. Silently
+    /// stays off if there is no mouse or the platform refuses the mode, so a
+    /// caller can ask and then read this back to see whether it happened.
+    /// </summary>
+    public static bool MouseCaptured
+    {
+        get => _mouseCaptured;
+        set
+        {
+            if (_mouse == null || value == _mouseCaptured) return;
+
+            var cursor = _mouse.Cursor;
+            var mode = value
+                ? (cursor.IsSupported(CursorMode.Raw) ? CursorMode.Raw : CursorMode.Disabled)
+                : CursorMode.Normal;
+
+            try { cursor.CursorMode = mode; }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine($"[Host] mouse capture unavailable: {e.Message}");
+                return;
+            }
+
+            _mouseCaptured = value;
+            _mouseSeen = false;
+            _mouseDx = _mouseDy = 0f;
+        }
+    }
+
+    /// <summary>Motion since the last call, in window pixels, and cleared by
+    /// it.</summary>
+    public static (float X, float Y) TakeMouseMotion()
+    {
+        var motion = (_mouseDx, _mouseDy);
+        _mouseDx = _mouseDy = 0f;
+        return motion;
+    }
+
+    public static bool IsMouseButtonDown(MouseButton button) =>
+        _mouse != null && _mouse.IsButtonPressed(button);
+
     public static void Poll()
     {
         Controller.Analog = ConfigManager.Game.PadKind == PadKind.Analog;
@@ -143,6 +205,7 @@ internal static unsafe class InputManager
 
     public static void Shutdown()
     {
+        MouseCaptured = false;
         CloseControllers();
         _sdl?.QuitSubSystem(Sdl.InitGamecontroller);
         _sdl?.Dispose();
@@ -466,6 +529,14 @@ internal static unsafe class InputManager
 
     private static void OnMouseMove(IMouse mouse, Vector2 position)
     {
+        if (_mouseSeen)
+        {
+            _mouseDx += position.X - _mousePos.X;
+            _mouseDy += position.Y - _mousePos.Y;
+        }
+        _mousePos = position;
+        _mouseSeen = true;
+
         if (EventBus.HasAnyListeners<MouseEvent>())
             EventBus.Dispatch(new MouseEvent
             {

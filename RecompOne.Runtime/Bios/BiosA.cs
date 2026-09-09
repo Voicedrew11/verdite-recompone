@@ -704,8 +704,13 @@ public static class BiosA
                 m.WriteU8(tAddr + i, data[0x800 + (int)i]);
             Dispatcher.TryLoad(CdUtils.OverlayName(name));
         }
-
-        return hdr;
+        // The real BIOS A(41h) LoadTest and A(42h) Load return 1 on success and 0
+        // on failure, not the header pointer. King's Field's boot stub compares the
+        // result against 1 exactly and retries forever when it does not match, so
+        // returning hdr here deadlocks the loader before it can reach Exec.
+        // The other callers (0x41, 0x42, 0x51) only test against zero.
+        // Upstream still returns hdr; this is 0001 and it is permanent.
+        return 1u;
     }
 
     private static uint DoExec(CpuContext c, IMemory m, uint hdr, uint argc, uint argv)

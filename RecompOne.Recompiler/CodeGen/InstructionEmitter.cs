@@ -42,6 +42,16 @@ public static class InstructionEmitter
         return $"{{ var _s = {R(rs)}; var _t = {R(rt)}; {body}{Hook(call)} }}";
     }
 
+    // 0035. Loads and stores hold the address in a local rather than emitting the
+    // address expression twice. `lw $t0, 0($t0)` overwrites its own base register,
+    // so a second evaluation after the load would hand the hook an address the
+    // access never used -- and binding a vertex to the wrong word is exactly the
+    // failure this whole mechanism exists to avoid. Upstream emits Addr() twice.
+    private static string TrackMem(string body, string call, int rs, short imm, bool moved, uint reloc)
+    {
+        return $"{{ var _a = {Addr(rs, imm, moved, reloc)}; {body}{Hook(call)} }}";
+    }
+
     private static string Addr(int rs, short imm, bool moved = false, uint reloc = 0)
     {
         if (moved) return $"0x{reloc:X8}u";
@@ -214,22 +224,22 @@ public static class InstructionEmitter
                 Track1($"{RT} = {RS} | 0x{immU:X4}u;", $"Ori({rt}, {rs}, 0x{immU:X4}, {RT}, _v)", rs),
             14 => rt == 0 ? "" : Track1($"{RT} = {RS} ^ 0x{immU:X4}u;", $"Ori({rt}, {rs}, 0x{immU:X4}, {RT}, _v)", rs),
             15 => rt == 0 ? "" : $"{RT} = 0x{(uint)immU << 16:X8}u;" + Hook($"Lui({rt}, {RT})"),
-            32 => rt == 0 ? "" : $"{RT} = (uint)(sbyte)mem.ReadU8({Addr(rs, imm, moved, reloc)});" + Hook($"Invalidate({rt})"),
-            33 => rt == 0 ? "" : $"{RT} = (uint)(short)mem.ReadU16({Addr(rs, imm, moved, reloc)});" + Hook($"Lh({rt}, {Addr(rs, imm, moved, reloc)}, {RT})"),
-            34 => rt == 0 ? "" : $"{RT} = mem.ReadWordLeft({RT}, {Addr(rs, imm, moved, reloc)});" + Hook($"Invalidate({rt})"),
-            35 => rt == 0 ? "" : $"{RT} = mem.ReadU32({Addr(rs, imm, moved, reloc)});" + Hook($"Lw({rt}, {Addr(rs, imm, moved, reloc)}, {RT})"),
-            36 => rt == 0 ? "" : $"{RT} = mem.ReadU8({Addr(rs, imm, moved, reloc)});" + Hook($"Invalidate({rt})"),
-            37 => rt == 0 ? "" : $"{RT} = mem.ReadU16({Addr(rs, imm, moved, reloc)});" + Hook($"Lh({rt}, {Addr(rs, imm, moved, reloc)}, {RT})"),
-            38 => rt == 0 ? "" : $"{RT} = mem.ReadWordRight({RT}, {Addr(rs, imm, moved, reloc)});" + Hook($"Invalidate({rt})"),
-            40 => $"mem.WriteU8({Addr(rs, imm, moved, reloc)}, (byte){RT});" + Hook($"InvalidateMem({Addr(rs, imm, moved, reloc)}, {RT})"),
-            41 => $"mem.WriteU16({Addr(rs, imm, moved, reloc)}, (ushort){RT});" + Hook($"Sh({rt}, {Addr(rs, imm, moved, reloc)}, {RT})"),
-            42 => $"mem.WriteWordLeft({Addr(rs, imm, moved, reloc)}, {RT});" + Hook($"InvalidateMem({Addr(rs, imm, moved, reloc)}, {RT})"),
-            43 => $"mem.WriteU32({Addr(rs, imm, moved, reloc)}, {RT});" + Hook($"Sw({rt}, {Addr(rs, imm, moved, reloc)}, {RT})"),
-            46 => $"mem.WriteWordRight({Addr(rs, imm, moved, reloc)}, {RT});" + Hook($"InvalidateMem({Addr(rs, imm, moved, reloc)}, {RT})"),
+            32 => rt == 0 ? "" : TrackMem($"{RT} = (uint)(sbyte)mem.ReadU8(_a);", $"Invalidate({rt})", rs, imm, moved, reloc),
+            33 => rt == 0 ? "" : TrackMem($"{RT} = (uint)(short)mem.ReadU16(_a);", $"Lh({rt}, _a, {RT})", rs, imm, moved, reloc),
+            34 => rt == 0 ? "" : TrackMem($"{RT} = mem.ReadWordLeft({RT}, _a);", $"Invalidate({rt})", rs, imm, moved, reloc),
+            35 => rt == 0 ? "" : TrackMem($"{RT} = mem.ReadU32(_a);", $"Lw({rt}, _a, {RT})", rs, imm, moved, reloc),
+            36 => rt == 0 ? "" : TrackMem($"{RT} = mem.ReadU8(_a);", $"Invalidate({rt})", rs, imm, moved, reloc),
+            37 => rt == 0 ? "" : TrackMem($"{RT} = mem.ReadU16(_a);", $"Lh({rt}, _a, {RT})", rs, imm, moved, reloc),
+            38 => rt == 0 ? "" : TrackMem($"{RT} = mem.ReadWordRight({RT}, _a);", $"Invalidate({rt})", rs, imm, moved, reloc),
+            40 => TrackMem($"mem.WriteU8(_a, (byte){RT});", $"InvalidateMem(_a, {RT})", rs, imm, moved, reloc),
+            41 => TrackMem($"mem.WriteU16(_a, (ushort){RT});", $"Sh({rt}, _a, {RT})", rs, imm, moved, reloc),
+            42 => TrackMem($"mem.WriteWordLeft(_a, {RT});", $"InvalidateMem(_a, {RT})", rs, imm, moved, reloc),
+            43 => TrackMem($"mem.WriteU32(_a, {RT});", $"Sw({rt}, _a, {RT})", rs, imm, moved, reloc),
+            46 => TrackMem($"mem.WriteWordRight(_a, {RT});", $"InvalidateMem(_a, {RT})", rs, imm, moved, reloc),
             50 =>
-                $"{{ var _lw = mem.ReadU32({Addr(rs, imm, moved, reloc)}); RecompOne.Runtime.Gte.Write({rt}, _lw); RecompOne.Runtime.Pgxp.PgxpCpu.Lwc2({rt}, {Addr(rs, imm, moved, reloc)}, _lw); }}",
+                $"{{ var _a = {Addr(rs, imm, moved, reloc)}; var _lw = mem.ReadU32(_a); RecompOne.Runtime.Gte.Write({rt}, _lw); RecompOne.Runtime.Pgxp.PgxpCpu.Lwc2({rt}, _a, _lw); }}",
             58 =>
-                $"{{ var _sw = RecompOne.Runtime.Gte.Read({rt}); mem.WriteU32({Addr(rs, imm, moved, reloc)}, _sw); RecompOne.Runtime.Pgxp.PgxpCpu.Swc2({rt}, {Addr(rs, imm, moved, reloc)}, _sw); }}",
+                $"{{ var _a = {Addr(rs, imm, moved, reloc)}; var _sw = RecompOne.Runtime.Gte.Read({rt}); mem.WriteU32(_a, _sw); RecompOne.Runtime.Pgxp.PgxpCpu.Swc2({rt}, _a, _sw); }}",
             _ => UnknownInstr(i, $"op=0x{op:X2}")
         };
     }

@@ -9,7 +9,6 @@ public static class LibCdStream
     private const int HeaderSize = 32;
     private const int SlotData = 2016;
     private const ushort VideoMagic = 0x0160;
-    private const int PrimeFrames = 2;
 
     public static bool InUse { get; private set; }
     private static uint _statusBase;
@@ -24,7 +23,6 @@ public static class LibCdStream
     private static readonly Stopwatch _clock = new();
 
     private static int _writeIdx;
-    private static bool _primed;
     private static bool[] _busy = Array.Empty<bool>();
     private static readonly Queue<(int start, int n)> _ready = new();
     private static int _prevStart = -1, _prevN;
@@ -175,7 +173,6 @@ public static class LibCdStream
 
     private static void ResetRing(IMemory m)
     {
-        _primed = false;
         _writeIdx = 0;
         _prevStart = -1;
         _prevN = 0;
@@ -253,14 +250,22 @@ public static class LibCdStream
                 continue;
             }
 
-            if (_primed)
+            // 0026. The disc is what paces an STR movie: sectors arrive at
+            // LibCd.SectorsPerSecond and a frame is several of them, so the movie's
+            // frame rate is the delivery rate divided by its sectors per frame.
+            // Pace from the moment the stream starts -- there is no free burst on
+            // hardware and a latch that has to be tripped can fail to trip. It did:
+            // priming used to wait for two decoded frames to sit in the ring at once,
+            // which a 32-slot ring cannot hold for a movie of 13-14 sectors a frame
+            // once the game is draining it as fast as it arrives. That movie was
+            // delivered unthrottled and therefore played at whatever rate the game's
+            // display loop ran at -- measured 60 frames a second at KF2_FPS=60 and
+            // ~95 at 144, against the 15 the two 9-sector movies before it held.
+            var delivered = _clock.Elapsed.TotalSeconds * LibCd.SectorsPerSecond;
+            if (_streamLba - _streamStartLba + n > delivered)
             {
-                var delivered = _clock.Elapsed.TotalSeconds * LibCd.SectorsPerSecond;
-                if (_streamLba - _streamStartLba + n > delivered)
-                {
-                    Thread.Sleep(1);
-                    continue;
-                }
+                Thread.Sleep(1);
+                continue;
             }
 
             int start;
@@ -290,13 +295,6 @@ public static class LibCdStream
                 for (var i = 0; i < n; i++) _busy[start + i] = true;
                 _ready.Enqueue((start, n));
                 _writeIdx = start + n;
-
-                if (!_primed && _ready.Count >= PrimeFrames)
-                {
-                    _primed = true;
-                    _streamStartLba = _streamLba;
-                    _clock.Restart();
-                }
             }
         }
     }

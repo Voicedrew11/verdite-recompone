@@ -29,6 +29,79 @@ public static class LibCd
         SeekP = 0x16,
         ReadS = 0x1B;
 
+    // 0005. libcd's interrupt handler turns each CD interrupt into a DeliverEvent
+    // on HwCdRom, and a game that opened those events with EvMdINTR gets its
+    // handler called. A static recompilation has no interrupt path, and upstream's
+    // rewritten LibCd signals only through the sync/ready/data *callbacks* -- so
+    // without this an event-driven loader never advances. King's Field's is one:
+    // measured, GAME.EXE loads and then sits in a disc wait forever, no fdat
+    // module, no area.
+    private const uint HwCdRom = 0xF0000003u;
+
+    private const uint EvSpACK = 0x0010u, EvSpCOMP = 0x0020u, EvSpDR = 0x0040u, EvSpERROR = 0x8000u;
+    private const int MaxQueuedEvents = 64;
+    private const int MaxEventsPerTick = 16;
+    private const int MaxSectorEventsPerTick = 16;
+    private static readonly Queue<uint> _events = new();
+
+    private static void QueueEvent(uint spec)
+    {
+        lock (_events)
+        {
+            if (_events.Count >= MaxQueuedEvents) return;
+            _events.Enqueue(spec);
+        }
+    }
+
+    //Deliver at interrupt time rather than inside the command, so a handler that
+    //issues the next command does not recurse on top of this one. New events
+    //queued by a handler are eligible in the same drain, which is what keeps an
+    //event-driven loader running at more than one step a frame.
+    private static void PumpEvents(CpuContext c, IMemory m)
+    {
+        for (var i = 0; i < MaxEventsPerTick; i++)
+        {
+            uint spec;
+            lock (_events)
+            {
+                if (_events.Count == 0) return;
+                spec = _events.Dequeue();
+            }
+
+            Bios.BiosB.DeliverEventIntr(c, m, HwCdRom, spec);
+        }
+    }
+
+    //One EvSpDR per sector for the duration of a ReadN, the way the drive would
+    //raise INT1. The handler is expected to CdGetSector the sector, which is what
+    //advances the drive; the burst is bounded so a handler that does not cannot
+    //spin here.
+    private static void PumpSectorEvents(CpuContext c, IMemory m)
+    {
+        for (var i = 0; i < MaxSectorEventsPerTick && _readActive; i++)
+        {
+            _lastIntr = DataReady;
+            Dispatcher.LoadByLba(CurrentLba);
+            Bios.BiosB.DeliverEventIntr(c, m, HwCdRom, EvSpDR);
+        }
+    }
+
+    private static void QueueCommandEvents(byte com)
+    {
+        QueueEvent(EvSpACK);
+        switch (com)
+        {
+            case Init:
+            case Stop:
+            case Pause:
+            case SeekL:
+            case SeekP:
+            case Standby:
+                QueueEvent(EvSpCOMP);
+                break;
+        }
+    }
+
     private const int Complete = 0x02;
     private const int DataEnd = 0x04;
     private const int DataReady = 0x01;
@@ -124,7 +197,15 @@ public static class LibCd
         var result = c.A1;
         PumpSync();
         PumpReady(1);
-        if (_readActive && _cbReady == 0 && _cbData == 0) _lastIntr = DataReady;
+        // 0005. The emulated drive always has the next sector to hand, so report
+        // it ready for a read with no read callback registered; the callback path
+        // is Tick()'s job.
+        if (_readActive && _cbReady == 0 && _cbData == 0 && _lastIntr != DiskError)
+        {
+            _lastResult[0] = _status;
+            for (var i = 1; i < _lastResult.Length; i++) _lastResult[i] = 0;
+            _lastIntr = DataReady;
+        }
         if (result != 0) WriteResult(m, result);
         c.V0 = (uint)_lastIntr;
     }
@@ -168,6 +249,7 @@ public static class LibCd
         }
 
         _lastIntr = Complete;
+        QueueEvent(EvSpCOMP);
         c.V0 = 1;
     }
 
@@ -270,16 +352,28 @@ public static class LibCd
             return;
         }
 
+        var c = Runtime.Cpu;
+        var m = Runtime.Mem;
+        if (c == null || m == null) return;
+
+        // 0005. Before anything else: the kernel events the game's loader waits on.
+        PumpEvents(c, m);
+
         PumpSync();
         PumpDataIrq();
         var xaMode = (_mode & 0x40) != 0;
 
         if (_xaActive && xaMode) return;
 
+        // A ReadN with no data callback is the polled/event-driven path, which
+        // upstream has no answer for.
+        if (_readActive && _cbData == 0 && _cbReady == 0)
+        {
+            PumpSectorEvents(c, m);
+            return;
+        }
+
         if (!_readActive || (_cbData == 0 && _cbReady == 0)) return;
-        var c = Runtime.Cpu;
-        var m = Runtime.Mem;
-        if (c == null || m == null) return;
 
         var snap = c.Snapshot();
         if (_cbData != 0)
@@ -942,6 +1036,11 @@ public static class LibCd
 
     private static void CdResetState()
     {
+        lock (_events)
+        {
+            _events.Clear();
+        }
+
         LibDs.Reset();
         LibCdStream.OnStopStream();
         _status = StatMotor; //drive aways spin
@@ -1166,6 +1265,8 @@ public static class LibCd
                 break;
         }
 
+        QueueCommandEvents(com);
+
         _lastResult[0] = _status;
         for (var i = 1; i < _lastResult.Length; i++) _lastResult[i] = 0;
         if (result != 0) WriteResult(m, result);
@@ -1219,6 +1320,7 @@ public static class LibCd
 
     private static void SetError(byte errByte, byte extraStat)
     {
+        QueueEvent(EvSpERROR);
         _lastIntr = DiskError;
         _lastResult[0] = (byte)(_status | extraStat);
         _lastResult[1] = errByte;

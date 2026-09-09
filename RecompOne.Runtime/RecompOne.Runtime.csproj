@@ -18,7 +18,9 @@
         <EmbeddedResource Include="Bios\Fonts\font2.raw"/>
         <EmbeddedResource Include="Host\Window\Assets\fa-solid-900.ttf"/>
         <EmbeddedResource Include="Host\Window\Assets\NotoSans-Regular.ttf"/>
-        <EmbeddedResource Include="Host\Window\Assets\NotoSansCJK-Regular.otf"/>
+        <!-- Upstream also embeds NotoSansCJK-Regular.otf. Deliberately not
+             carried: a second 16.5 MB resource in every release artifact, to
+             render strings none of the runtime's three languages contain. -->
         <EmbeddedResource Include="Host\Window\Assets\languages.json"/>
     </ItemGroup>
 

@@ -1,3 +1,4 @@
+using ImGuiNET;
 using RecompOne.Runtime.Config;
 
 namespace RecompOne.Runtime.Host.Window;
@@ -84,6 +85,21 @@ public static class MainMenuBar
     private static void ResetView()
     {
         ConfigManager.ResetView(PanelManager.Panels);
+
+        // ResetView puts a default ViewConfig back, but nothing reads the scale or
+        // the colours *out of* the config after startup: the UI scale lives on in
+        // io.FontGlobalScale and in the sizes ScaleAllSizes baked into the style,
+        // and the accent and background live on in Theme's own fields. Popups take
+        // Theme.Scale live and shrink the same frame, so without this the reset
+        // lands half-done -- small windows, giant text -- and the one thing a
+        // person reaches for this item to undo is the one thing left behind.
+        //
+        // This is the escape hatch from a scale too large to work in, so it has to
+        // finish the job: it is reachable from the menu bar, which is anchored at
+        // the top-left corner and is the last thing to leave the window.
+        ImGui.GetIO().FontGlobalScale = ConfigManager.View.UiScale;
+        Theme.Load();
+
         HostWindow.RequestLayout();
     }
 
