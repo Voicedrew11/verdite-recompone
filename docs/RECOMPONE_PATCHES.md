@@ -2074,6 +2074,19 @@ Four files in the directory have no entry below:
   in 0.1 ms with no upload frame, against 35 ms and a 56-65 ms frame before; a
   first visit 35 ms as before. With `StaticKeep` at 0 nothing is kept, parked or
   readied, so Verdite2 and Verdite3 run the old path. **No recompile.**
+- `0112-headless-turbo.patch` — a run nobody watches. `Runtime.Headless` (the game
+  sets it, from `KF2_HEADLESS` or `KF1_HEADLESS`) takes `HostWindow` down the path
+  it already had for a failed GL start: no window, no context, `_headless` set.
+  `Audio` opens no device. `ConfigManager.SaveView` returns before asking ImGui
+  for its ini when there is no context, which was a native fault (a settings
+  migration saved the view at boot). `FrameClock` drops its ceiling while
+  `Interrupts.Turbo` is set, so turbo is no longer held to the target rate by the
+  present. `Gpu.NoRaster` skips the software rasterizer's pixels and nothing
+  before them; headless, that was half a frame. Measured in KF2: about 650 frames
+  a second for one run, 430-850 each with six at once, against 250 rasterizing.
+  Written in Verdite2's copy as a second `0111`; renumbered here, where `0111`
+  was already taken. Nothing changes unless a port sets `Headless` or `NoRaster`
+  (Turbo's ceiling aside, which only the menu's Turbo item sets). **No recompile.**
 
 ## Package bumps
 
