@@ -123,6 +123,16 @@ Four files in the directory have no entry below:
   the two halves are reunited without following a register or a store. A miss is
   the old affine behaviour, which is what makes it safe on by default. See
   "Perspective correction" in `docs/RENDERING.md`.
+  Since amended (2026-10-22): the texel's truncation direction comes from a
+  `noperspective` copy of the UV (`vUVAffine` in `WorldVs`/`PrimVs`/`PrimFs`,
+  `vUvAffine` in `NormalVs`/`WorldNormalVs`/`NormalFs`), not from the derivative of the
+  perspective-correct one. The console's gradient is affine, so its sign is constant
+  across a triangle; the perspective-correct dV/dy on a floor or ceiling, where V runs
+  across the screen, turns over at the projection centre, and the texel there jumped
+  between `floor` and `ceil`: a one-texel seam fixed at the screen's centre column,
+  seen in KF1, Verdite2 and Verdite3. An affine primitive (W of 1) chooses as before.
+  The GLSL 120 backend has no `noperspective` and is unchanged. The amendment is the
+  second diff in the patch file.
 
 - `0010-subpixel-vertex-positions.patch` — the GTE projects to 16.16 and then keeps
   only the whole part, so a vertex drifting slowly holds still and then jumps a
