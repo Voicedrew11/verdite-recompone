@@ -843,6 +843,22 @@ Four files in the directory have no entry below:
   271 entries, and `GlTexCache.Lookup` 83% of `DrawOTag`'s time in area 5; after,
   394 -> 893 fps there and 292 -> 647 at area 1's door, and views that do not fill
   the atlas unchanged.
+  Amended again: entries shared per aligned square, behind `GteDepth.MipShare` (off
+  unless the game sets it). An entry was keyed on the polygon's own texture
+  rectangle, and neighbouring polygons' rectangles overlap, so the atlas held the
+  same texels many times: in KF1 a full atlas of 124 entries spent 4.19M texels of
+  blocks on 1.51M of rectangles over 247K distinct texels, 63 of the 124 inside
+  another, and one frame refused 391 more wanting 17.8M; no atlas size fits that.
+  Under the switch an entry is the smallest square of the page, aligned to its size
+  (8-256), holding the rectangle, unless it reaches into a scrolling texture; flags
+  bit 29 marks it, and the shader finds the square's corner by rounding the
+  rectangle's down to that size, so nothing new is carried. Taps are still held
+  inside the rectangle, and the level is capped at the rectangle's own block, but a
+  coarse level now averages the page's texels past the rectangle's edge where the
+  block used to repeat its edge. Off, keys, flags and shader arithmetic are as
+  before. Measured in KF1 (2026-10-22, uncapped, render distance 30, areas 1, 3, 4
+  and 5): 365 entries at most, no refusals and no evictions, against 200,000-850,000
+  refusals a second without it; frame rates within 10% either way.
 
 - `0061-window-icon-sizes-and-app-id.patch` — two things one icon needs.
   `SetWindowIcon` was handed exactly one image, so a desktop asking for 32 or 48

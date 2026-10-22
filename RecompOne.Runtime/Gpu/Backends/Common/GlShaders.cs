@@ -2315,32 +2315,32 @@ internal static class GlShaders
         // 0060. One level of the decoded texture, bilinear, at a level-0 texel
         // position inside the rectangle. Held half a level texel in from the edge,
         // so the bilinear taps never leave the block.
-        vec4 mipAt(vec2 local, float level, vec2 ext, vec2 block) {
+        vec4 mipAt(vec2 local, float level, vec2 rLo, vec2 rHi, vec2 block) {
             float sz = exp2(level);
-            vec2 lo = vec2(0.5 * sz);
-            vec2 p = clamp(local, lo, max(ext - lo, lo));
+            vec2 lo = rLo + vec2(0.5 * sz);
+            vec2 p = clamp(local, lo, max(rHi - vec2(0.5 * sz), lo));
             return textureLod(uMip, (block + p) / 2048.0, level);
         }
 
         // n taps across the whole long axis, each trilinear at lod, premultiplied by
         // solidity. Level 0 is the exact texel, so the filter meets the console's
         // point sample where the footprint shrinks to one texel.
-        vec4 mipFootprint(vec2 axis, float n, float lod, ivec2 rMin, ivec2 rMax, vec2 block, bool negU, bool negV) {
-            vec2 ext = vec2(rMax - rMin + 1);
+        vec4 mipFootprint(vec2 axis, float n, float lod, ivec2 rMin, ivec2 rMax, ivec2 origin, vec2 block, bool negU, bool negV) {
+            vec2 rLo = vec2(rMin - origin), rHi = vec2(rMax - origin + 1);
             float k0 = floor(lod), f = lod - k0;
             vec4 acc = vec4(0.0);
             for (int i = 0; i < 16; ++i) {
                 if (float(i) >= n) break;
                 vec2 t = vUV + axis * ((float(i) + 0.5) / n - 0.5);
-                vec2 local = t - vec2(rMin);
+                vec2 local = t - vec2(origin);
                 vec4 a;
                 if (k0 < 0.5) {
                     vec4 c = decode(clamp(truncUV(t, negU, negV), rMin, rMax));
                     a = (c.rgb == vec3(0.0) && c.a < 0.5) ? vec4(0.0) : vec4(c.rgb, 1.0);
                 } else {
-                    a = mipAt(local, k0, ext, block);
+                    a = mipAt(local, k0, rLo, rHi, block);
                 }
-                vec4 b = f > 0.0 ? mipAt(local, k0 + 1.0, ext, block) : a;
+                vec4 b = f > 0.0 ? mipAt(local, k0 + 1.0, rLo, rHi, block) : a;
                 acc += mix(a, b, f);
             }
             return acc / n;
@@ -2803,10 +2803,23 @@ internal static class GlShaders
                 // `major > 0.0` is false for the NaN a degenerate triangle hands dFdx.
                 if (major > 0.0 && uMipOn > 0.5 && vRepClut == 0 && (vTex.y & 0x40000000u) != 0u) {
                     float n = clamp(ceil(major / max(minor, 1e-4)), 1.0, max(uAniso, 1.0));
-                    float maxLod = float((vTex.y >> 16) & 15u);
+                    int log2Size = int((vTex.y >> 16) & 15u);
+                    float maxLod = float(log2Size);
+                    ivec2 origin = rMin;
+                    // A shared square: aligned to its size, so it starts where the
+                    // rectangle's corner rounds down to; no coarser than the rectangle's own block.
+                    if ((vTex.y & 0x20000000u) != 0u) {
+                        ivec2 r0 = ivec2(int(vTex.x & 255u), int((vTex.x >> 8) & 255u));
+                        ivec2 r1 = ivec2(int((vTex.x >> 16) & 255u), int(vTex.x >> 24));
+                        origin = (r0 >> log2Size) << log2Size;
+                        int ext = max(r1.x - r0.x, r1.y - r0.y);
+                        int own = 3;
+                        while (own < log2Size && (1 << own) <= ext) own++;
+                        maxLod = float(own);
+                    }
                     float lod = min(log2(max(major / n, minor)), maxLod); // domain-ok: major > 0 is tested and n >= 1
                     if (lod > 0.0) {
-                        vec4 acc = mipFootprint(axis, n, lod, rMin, rMax,
+                        vec4 acc = mipFootprint(axis, n, lod, rMin, rMax, origin,
                             vec2(float(vTex.y & 255u), float((vTex.y >> 8) & 255u)) * 8.0,
                             gNegU, gNegV);
                         if (acc.a > 0.0) texel = vec4(acc.rgb / acc.a, texel.a);
