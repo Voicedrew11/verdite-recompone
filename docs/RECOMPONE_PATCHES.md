@@ -2098,6 +2098,13 @@ Four files in the directory have no entry below:
   fuzz run, six at once, against about 420 before. **Recompile to take it**;
   without the flag the output is byte-for-byte what it was, so Verdite2 and
   Verdite3 do not move.
+- `0114-soft-faults.patch` — a bad pointer as a report rather than the end of a
+  run. With `PSMemory.SoftFaults` set, an access `Resolve` cannot map (unmapped,
+  or crossing the scratchpad's end) calls `PSMemory.UnmappedAccess(address, size,
+  write)` and reads zeros from, or writes into, a per-thread scratch buffer,
+  where it used to throw. Only the two throw sites changed; the RAM, scratchpad
+  and register paths are untouched. Off by default (KF1's fuzzer turns it on), so
+  nothing changes for a port that does not set it. **No recompile.**
 
 ## Package bumps
 
