@@ -833,6 +833,16 @@ Four files in the directory have no entry below:
   pixels inside the rectangle; this leaks 0. GL core only. **No recompile.** See
   "The taps still left the texture at its edge" and "Mipmaps where the texture is
   decoded" in `docs/RENDERING.md`.
+  Since amended: a full atlas refuses fast. With every entry drawn this frame or the
+  last, `Allocate` found nothing to evict, but each miss still listed, sorted and
+  walked every entry before it refused, and a view that overflows the atlas asks
+  again for each texture it could not place, every frame. A refusal now holds for
+  the frame at that block size and larger, until a decode leaves the queue or the
+  cache resets; the answers are the same, so nothing drawn moves. Measured in KF1
+  (2026-10-22, uncapped, render distance 30): 220,000-600,000 refusals a second,
+  271 entries, and `GlTexCache.Lookup` 83% of `DrawOTag`'s time in area 5; after,
+  394 -> 893 fps there and 292 -> 647 at area 1's door, and views that do not fill
+  the atlas unchanged.
 
 - `0061-window-icon-sizes-and-app-id.patch` — two things one icon needs.
   `SetWindowIcon` was handed exactly one image, so a desktop asking for 32 or 48

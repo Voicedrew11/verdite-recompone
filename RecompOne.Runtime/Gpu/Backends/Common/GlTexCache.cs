@@ -59,6 +59,11 @@ sealed class GlTexCache
     // Buddy allocator: free blocks per size, keyed by block index at that size.
     readonly HashSet<int>[] _free = new HashSet<int>[AtlasLog + 1];
 
+    // The smallest block refused in frame _fullFrame with nothing left to evict: a block
+    // as large fails too until a frame passes or a decode leaves the queue.
+    long _fullFrame = -1;
+    int _fullLog;
+
     public GlTexCache(GL gl) => _gl = gl;
 
     public uint Texture => _tex;
@@ -124,6 +129,7 @@ sealed class GlTexCache
         _queue.Clear();
         for (int i = 0; i <= AtlasLog; i++) _free[i] = [];
         _free[AtlasLog].Add(0);
+        _fullFrame = -1;
         GteDepth.MipEntries = 0;
     }
 
@@ -234,6 +240,7 @@ sealed class GlTexCache
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
         _gl.BindVertexArray(0);
         foreach (var e in _queue) e.Queued = false;
+        _fullFrame = -1;
         GteDepth.MipDecodes += n;
         _queue.Clear();
     }
@@ -293,6 +300,7 @@ sealed class GlTexCache
 
     bool Allocate(int log, long frame, out int x, out int y)
     {
+        if (frame == _fullFrame && log >= _fullLog) { x = y = 0; return false; }
         if (TryAllocate(log, out x, out y)) return true;
         // Evict what no frame since the last one has drawn, oldest first. The current
         // and previous frame's entries may still be in a batch not yet drawn.
@@ -308,6 +316,8 @@ sealed class GlTexCache
             if (TryAllocate(log, out x, out y)) { GteDepth.MipEntries = _entries.Count; return true; }
         }
         GteDepth.MipEntries = _entries.Count;
+        _fullLog = frame == _fullFrame ? Math.Min(_fullLog, log) : log;
+        _fullFrame = frame;
         return false;
     }
 
