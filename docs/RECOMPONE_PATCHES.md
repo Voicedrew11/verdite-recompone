@@ -2087,6 +2087,17 @@ Four files in the directory have no entry below:
   Written in Verdite2's copy as a second `0111`; renumbered here, where `0111`
   was already taken. Nothing changes unless a port sets `Headless` or `NoRaster`
   (Turbo's ceiling aside, which only the menu's Turbo item sets). **No recompile.**
+- `0113-function-coverage.patch` — which recompiled functions a run reached, for
+  a fuzzer to know what it never tried. Under `"coverage": true` in the config,
+  the recompiler numbers every emitted function with a body (stubs and patches
+  have none) 0, 1, 2... across all overlays in emission order, opens each body
+  with `if (Coverage.On) Coverage.Hits[N] = 1;`, and writes `coverage.tsv`
+  (index, overlay, address, name) beside the generated files.
+  `RecompOne.Runtime.Diagnostics.Coverage` holds the 64 KiB of hit bytes and
+  `HitIndices()`. Measured in KF1 (1,590 functions): 431 frames a second per
+  fuzz run, six at once, against about 420 before. **Recompile to take it**;
+  without the flag the output is byte-for-byte what it was, so Verdite2 and
+  Verdite3 do not move.
 
 ## Package bumps
 
