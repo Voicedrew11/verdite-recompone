@@ -522,7 +522,6 @@ internal static class GlShaders
         out float vDepth;
         flat out float vM;
         out vec2 vUv;
-        noperspective out vec2 vUvAffine;
         flat out uint vTex;
         // 0089. The world program's; no packet is faded.
         out vec2 vFadeXZ;
@@ -537,7 +536,6 @@ internal static class GlShaders
             vDepth = inZ * (1.0/65536.0);
             vM = inM;
             vUv = inUv;
-            vUvAffine = inUv;
             vTex = inTex;
             vFadeXZ = vec2(0.0);
         }
@@ -561,7 +559,6 @@ internal static class GlShaders
         in float vDepth;
         flat in float vM;
         in vec2 vUv;
-        noperspective in vec2 vUvAffine;
         flat in uint vTex;
         // 0089. A world corner's X and Z, for DistanceFade (WorldNormalVs).
         in vec2 vFadeXZ;
@@ -638,8 +635,10 @@ internal static class GlShaders
             // driver gave every edge pixel a wrong normal, and the occlusion
             // pass drew a dark line along every edge.
             vec2 dUvx = dFdx(vUv), dUvy = dFdy(vUv);
-            // The console's affine gradient picks the truncation's direction, as in PrimFs.
-            vec2 dUax = dFdx(vUvAffine), dUay = dFdy(vUvAffine);
+            // The truncation's direction, as in PrimFs.
+            // W is a view depth of tens of units or more, or 1 with none recovered.
+            bool affine = gl_FragCoord.w > 0.999;
+            bool negU = affine && dUvx.x < 0.0, negV = affine && dUvy.y < 0.0;
             vec3 p = vec3((gl_FragCoord.xy / uScale - uCentre) * (z / uProjH), z);
             vec3 dpx = dFdx(p), dpy = dFdy(p);
             // 0089. A pixel the colour pass dithers away by distance is no surface.
@@ -676,8 +675,8 @@ internal static class GlShaders
             // otherwise lay its own normal over the wall the depth buffer holds.
             // The texel is PrimFs's centre tap, truncated the way it rounds.
             if ((vTex & 0x80000000u) != 0u) {
-                ivec2 tc = ivec2(dUax.x < 0.0 ? int(ceil(vUv.x - 0.0001)) : int(floor(vUv.x + 0.0001)),
-                                 dUay.y < 0.0 ? int(ceil(vUv.y - 0.0001)) : int(floor(vUv.y + 0.0001)));
+                ivec2 tc = ivec2(negU ? int(ceil(vUv.x - 0.0001)) : int(floor(vUv.x + 0.0001)),
+                                 negV ? int(ceil(vUv.y - 0.0001)) : int(floor(vUv.y + 0.0001)));
                 vec4 t = veilTexel(tc);
                 if (t.rgb == vec3(0.0) && t.a < 0.5) discard;
             }
@@ -882,7 +881,6 @@ internal static class GlShaders
         out float vDepth;
         flat out float vM;
         out vec2 vUv;
-        noperspective out vec2 vUvAffine;
         flat out uint vTex;
         // 0089. As WorldVs's.
         out vec2 vFadeXZ;
@@ -934,7 +932,7 @@ internal static class GlShaders
                 }
                 if ((uModelBlend != 0 && m == 0u) || !modelFaceKept(inCue, inRgbc)) {
                     gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-                    vDepth = 0.0; vM = 0.0; vUv = vec2(0.0); vUvAffine = vec2(0.0); vTex = 0u;
+                    vDepth = 0.0; vM = 0.0; vUv = vec2(0.0); vTex = 0u;
                     return;
                 }
                 w = modelVertex(uint(inWorld.x));
@@ -945,7 +943,7 @@ internal static class GlShaders
             if (uHalfGate != 0 && hid != 0u
                 && texelFetch(uHalves, ivec2(int((hid - 1u) % 160u), int((hid - 1u) / 160u)), 0).r == 0u) {
                 gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-                vDepth = 0.0; vM = 0.0; vUv = vec2(0.0); vUvAffine = vec2(0.0); vTex = 0u;
+                vDepth = 0.0; vM = 0.0; vUv = vec2(0.0); vTex = 0u;
                 return;
             }
             // A blended face is kept only as water (bit 28), with 256 over its id
@@ -953,7 +951,7 @@ internal static class GlShaders
             bool semi = (flags & 0x400u) != 0u;
             if (semi && (flags & 0x10000000u) == 0u) {
                 gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-                vDepth = 0.0; vM = 0.0; vUv = vec2(0.0); vUvAffine = vec2(0.0); vTex = 0u;
+                vDepth = 0.0; vM = 0.0; vUv = vec2(0.0); vTex = 0u;
                 return;
             }
             if (uSwellOn != 0 && (flags & 0x8000000u) != 0u) w.y += swellDy(w);
@@ -972,7 +970,6 @@ internal static class GlShaders
             // GlShaders.RequireTexel fails the program if these go unread.
             int tp = int(inTexpageF + 0.5);
             vUv = inUV;
-            vUvAffine = inUV;
             vTex = (tp & 0x8000) != 0 ? 0u
                  : 0x80000000u | (uint(int(inClutF + 0.5)) & 0x7FFFu) << 16 | (uint(tp) & 0x7FFFu);
         }
@@ -1619,8 +1616,6 @@ internal static class GlShaders
 
         noperspective out vec4 vColor;
         out vec2 vUV;
-        // The UV as the console interpolates it, for the truncation's direction only.
-        noperspective out vec2 vUVAffine;
         out float vDepth;
         flat out ivec2 clutBase;
         flat out ivec2 pageBase;
@@ -1912,7 +1907,6 @@ internal static class GlShaders
             vDither = uWorldDither;
             vRepClut = 0;
             vUV = inUV;
-            vUVAffine = inUV;
 
             int inTexpage = int(inTexpageF + 0.5);
             int inClut = int(inClutF + 0.5);
@@ -1957,8 +1951,6 @@ internal static class GlShaders
         // as the hardware's, and so an untextured primitive is bit-identical.
         noperspective out vec4 vColor;
         out vec2 vUV;
-        // The UV as the console interpolates it, for the truncation's direction only.
-        noperspective out vec2 vUVAffine;
         out float vDepth;
         flat out ivec2 clutBase;
         flat out ivec2 pageBase;
@@ -2018,7 +2010,6 @@ internal static class GlShaders
             vFadeXZ = vec2(0.0);
             vDither = (inTexpage >> 10) & 1;
             vRepClut = (inTexpage >> 12) & 1;
-            vUVAffine = inUV;
 
             if ((inTexpage & 0x8000) != 0) {
                 texMode = 4;
@@ -2041,7 +2032,6 @@ internal static class GlShaders
         #version 330 core
         noperspective in vec4 vColor;
         in vec2 vUV;
-        noperspective in vec2 vUVAffine;
         in float vDepth;
         flat in ivec2 clutBase;
         flat in ivec2 pageBase;
@@ -2405,9 +2395,12 @@ internal static class GlShaders
         // Set at the top of main, before any discard (see there).
         vec3 gLightN;
         vec2 gUVdx, gUVdy, gWx, gWy;
-        // The truncation's direction from the console's affine gradient, constant
-        // across a triangle. The perspective-correct one turns over inside one --
-        // dV/dy on a floor or ceiling at the screen's centre -- and left a seam there.
+        // The truncation's direction. An affine primitive (W of 1 at every corner)
+        // takes the console's, from its UV gradient, constant across it. A
+        // perspective-correct one truncates down: its gradient turns over inside
+        // a triangle (dV/dy on a floor at the screen's centre, a seam there), and
+        // a per-triangle sign flips as the view moves (a triangle the near plane
+        // clips, or one crossing the centre), shifting its texture by a texel.
         bool gNegU, gNegV;
 
         vec3 authored(float spec, float rough, out vec3 hi) {
@@ -2612,7 +2605,9 @@ internal static class GlShaders
             // helper pixels may discard (a clip plane, a dither, a mask). Mesa
             // answered anyway; a Windows driver did not, along every edge.
             gUVdx = dFdx(vUV); gUVdy = dFdy(vUV);
-            gNegU = dFdx(vUVAffine).x < 0.0; gNegV = dFdy(vUVAffine).y < 0.0;
+            // W is a view depth of tens of units or more, or 1 with none recovered.
+            bool affine = gl_FragCoord.w > 0.999;
+            gNegU = affine && gUVdx.x < 0.0; gNegV = affine && gUVdy.y < 0.0;
             {
                 float lz = vDepth * 65536.0;
                 vec3 lp = vec3((gl_FragCoord.xy / float(uScale) - uLightCentre) * (lz / uLightH), lz);

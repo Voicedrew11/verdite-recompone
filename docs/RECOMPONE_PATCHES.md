@@ -123,16 +123,22 @@ Four files in the directory have no entry below:
   the two halves are reunited without following a register or a store. A miss is
   the old affine behaviour, which is what makes it safe on by default. See
   "Perspective correction" in `docs/RENDERING.md`.
-  Since amended (2026-10-22): the texel's truncation direction comes from a
-  `noperspective` copy of the UV (`vUVAffine` in `WorldVs`/`PrimVs`/`PrimFs`,
-  `vUvAffine` in `NormalVs`/`WorldNormalVs`/`NormalFs`), not from the derivative of the
-  perspective-correct one. The console's gradient is affine, so its sign is constant
-  across a triangle; the perspective-correct dV/dy on a floor or ceiling, where V runs
-  across the screen, turns over at the projection centre, and the texel there jumped
-  between `floor` and `ceil`: a one-texel seam fixed at the screen's centre column,
-  seen in KF1, Verdite2 and Verdite3. An affine primitive (W of 1) chooses as before.
-  The GLSL 120 backend has no `noperspective` and is unchanged. The amendment is the
-  second diff in the patch file.
+  Since amended (2026-10-22): a perspective-correct primitive truncates its texel
+  down (`floor`), whatever its gradient; an affine one (W of 1 at every corner, so
+  `gl_FragCoord.w` 1) takes `ceil` where its UV runs backwards, as before. The rule
+  had come from the sign of the perspective-correct UV's derivative, which on a floor
+  or ceiling, where V runs across the screen, turns over at the projection centre: a
+  one-texel seam fixed at the screen's centre column, seen in KF1, Verdite2 and
+  Verdite3. The first amendment took the sign from a `noperspective` copy of the UV
+  instead, constant across a triangle, but under a perspective-correct sample any
+  per-triangle choice that follows the view shifts the whole texture by a texel when
+  it flips, and it flips as the view moves: a triangle the near plane clips (the
+  retained scene's, whose affine gradient is then not the console's), or one crossing
+  the centre column. KF1's floors were reported shifting as the player stepped up to
+  them (not yet judged again with this rule). A rule
+  that does not depend on the view cannot do either, and the copy is gone. Only the
+  GL 3.3 programs (`PrimFs`, `NormalFs`) changed; the GLSL 120 backend still takes
+  the derivative's sign. The amendment is the second diff in the patch file.
 
 - `0010-subpixel-vertex-positions.patch` — the GTE projects to 16.16 and then keeps
   only the whole part, so a vertex drifting slowly holds still and then jumps a
